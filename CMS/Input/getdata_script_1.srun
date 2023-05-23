@@ -1,0 +1,6 @@
+#!/bin/bash
+#SBATCH -p main
+#SBATCH -q main
+#SBATCH -n 1
+
+srun getdata regional_connectivity 1

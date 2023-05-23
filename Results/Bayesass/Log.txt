@@ -1,0 +1,165 @@
+starting worker pid=22300 on localhost:11052 at 13:02:03.940
+starting worker pid=13952 on localhost:11052 at 13:02:04.108
+starting worker pid=4344 on localhost:11052 at 13:02:04.274
+starting worker pid=11616 on localhost:11052 at 13:02:04.477
+starting worker pid=8016 on localhost:11052 at 13:02:04.648
+Loading required package: dplyr
+
+Attaching package: 'dplyr'
+
+The following objects are masked from 'package:stats':
+
+    filter, lag
+
+The following objects are masked from 'package:base':
+
+    intersect, setdiff, setequal, union
+
+Loading required package: tidyr
+Loading required package: stringr
+Loading required package: dplyr
+
+Attaching package: 'dplyr'
+
+The following objects are masked from 'package:stats':
+
+    filter, lag
+
+The following objects are masked from 'package:base':
+
+    intersect, setdiff, setequal, union
+
+Loading required package: tidyr
+Loading required package: stringr
+Loading required package: dplyr
+
+Attaching package: 'dplyr'
+
+The following objects are masked from 'package:stats':
+
+    filter, lag
+
+The following objects are masked from 'package:base':
+
+    intersect, setdiff, setequal, union
+
+Loading required package: tidyr
+Loading required package: stringr
+Loading required package: dplyr
+
+Attaching package: 'dplyr'
+
+The following objects are masked from 'package:stats':
+
+    filter, lag
+
+The following objects are masked from 'package:base':
+
+    intersect, setdiff, setequal, union
+
+Loading required package: tidyr
+Loading required package: stringr
+Loading required package: dplyr
+
+Attaching package: 'dplyr'
+
+The following objects are masked from 'package:stats':
+
+    filter, lag
+
+The following objects are masked from 'package:base':
+
+    intersect, setdiff, setequal, union
+
+Loading required package: tidyr
+Loading required package: stringr
+Warning messages:
+1: package 'stringr' was built under R version 4.2.1 
+2: In readLines(path) :Warning messages:
+1: package 'stringr' was built under R version 4.2.1 
+2: In readLines(path) :Warning messages:
+1: package 'stringr' was built under R version 4.2.1 
+Warning messages:
+1: package 'stringr' was built under R version 4.2.1 
+2: 2: Warning messages:
+:In readLines(path) :1: package 'stringr' was built under R version 4.2.1 
+2: 
+  incomplete final line found on 'Riv_bayesass_out_1.txt'
+In readLines(path) :ecated in dplyr 0.8.0.
+ℹ Please use a list of either functions or lambdas:
+
+# Simple named list: list(mean = mean, median = median)
+
+# Auto named with `tibble::lst()`: tibble::lst(mean, median)
+
+# Using lambdas list(~ mean(., trim = .2), ~ median(., na.rm = TRUE))
+ℹ The deprecated feature was likely used in the flowR package.
+  Please report the issue to the authors. 
+4: `mutate_each_()` was deprecated in dplyr 0.7.0.
+ℹ Please use `across()` instead.
+ℹ The deprecated feature was likely used in the dplyr package.
+  Please report the issue at <https://github.com/tidyverse/dplyr/issues>. 
+
+  incomplete final line found on 'Riv_bayesass_out_2.txt'
+3: `funs()` was deprecated in dplyr 0.8.0.
+ℹ Please use a list of either functions or lambdas:
+
+# Simple named list: list(mean = mean, median = median)
+
+# Auto named with `tibble::lst()`: tibble::lst(mean, median)
+
+# Using lambdas list(~ mean(., trim = .2), ~ median(., na.rm = TRUE))
+ℹ The deprecated feature was likely used in the flowR package.
+  Please report the issue to the authors. 
+4: `mutate_each_()` was deprecated in dplyr 0.7.0.
+ℹ Please use `across()` instead.
+ℹ The deprecated feature was likely used in the dplyr package.
+  Please report the issue at <https://github.com/tidyverse/dplyr/issues>. 
+
+  incomplete final line found on 'Riv_bayesass_out_4.txt'
+3: `funs()` was deprecated in dplyr 0.8.0.
+ℹ Please use a list of either functions or lambdas:
+
+# Simple named list: list(mean = mean, median = median)
+
+# Auto named with `tibble::lst()`: tibble::lst(mean, median)
+
+# Using lambdas list(~ mean(., trim = .2), ~ median(., na.rm = TRUE))
+ℹ The deprecated feature was likely used in the flowR package.
+  Please report the issue to the authors. 
+4: `mutate_each_()` was deprecated in dplyr 0.7.0.
+ℹ Please use `across()` instead.
+ℹ The deprecated feature was likely used in the dplyr package.
+  Please report the issue at <https://github.com/tidyverse/dplyr/issues>. 
+
+  incomplete final line found on 'Riv_bayesass_out_5.txt'
+3: `funs()` was deprecated in dplyr 0.8.0.
+ℹ Please use a list of either functions or lambdas:
+
+# Simple named list: list(mean = mean, median = median)
+
+# Auto named with `tibble::lst()`: tibble::lst(mean, median)
+
+# Using lambdas list(~ mean(., trim = .2), ~ median(., na.rm = TRUE))
+ℹ The deprecated feature was likely used in the flowR package.
+  Please report the issue to the authors. 
+4: `mutate_each_()` was deprecated in dplyr 0.7.0.
+ℹ Please use `across()` instead.
+ℹ The deprecated feature was likely used in the dplyr package.
+  Please report the issue at <https://github.com/tidyverse/dplyr/issues>. 
+
+  incomplete final line found on 'Riv_bayesass_out_3.txt'
+3: `funs()` was deprecated in dplyr 0.8.0.
+ℹ Please use a list of either functions or lambdas:
+
+# Simple named list: list(mean = mean, median = median)
+
+# Auto named with `tibble::lst()`: tibble::lst(mean, median)
+
+# Using lambdas list(~ mean(., trim = .2), ~ median(., na.rm = TRUE))
+ℹ The deprecated feature was likely used in the flowR package.
+  Please report the issue to the authors. 
+4: `mutate_each_()` was deprecated in dplyr 0.7.0.
+ℹ Please use `across()` instead.
+ℹ The deprecated feature was likely used in the dplyr package.
+  Please report the issue at <https://github.com/tidyverse/dplyr/issues>. 

@@ -1,0 +1,3771 @@
+---
+title: "Ocean Current Mediated Gene Flow Rivulus Regional"
+author: "Anthony Snead"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# General Libraries
+
+````{r, General Libraries}
+# General libraries for data formatting
+library(tidyverse)
+library(data.table)
+library(lubridate)
+library(dplyr)
+library(stringr)
+library(purrr)
+library(RColorBrewer)
+
+# GIS libraries
+library(ncdf4)
+library(raster)
+library(sf)
+library(sp)
+library(smoothr)
+library(sfheaders)
+library(purrr)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(rnaturalearthhires)
+library(ggspatial)
+library(spatialEco)
+
+# Population Genetics Libraries
+library(adegenet)
+library(pegas)
+library(poppr)
+library(flowR)
+library(mmod)
+library(PopGenReport)
+library(polysat)
+
+```
+
+# Data Import and Formatting
+
+Here we import our genetic data, assign individuals to population groupings, and format the population genetic data for downstream analysis
+
+## Genetic Data Import
+
+Here we import our population genetic data. The file includes columns that are not needed as well as a sister species indicated by the presence of the R22.Dup marker.
+
+```{r, Data Import}
+# Read and format the population genetic data for the spatial analysis and the genid object
+Population.Data <- read.csv(paste(getwd(), "Data/rivulus_genetic_data.csv", sep = "/")) %>%
+  # R22.Dup is a microsatellite marker species to K. hermaphroditus. Therefore, we remove any individuals with that marker as they are not our species of interest.
+  dplyr::filter(is.na(R22.Dup) & is.na(R22.Dup.1)) %>%
+  #get rid of the columns
+  dplyr::select(-R22.Dup, -R22.Dup.1) %>%
+  # remove individual with greater than 10% missing data
+  dplyr::filter(rowSums((is.na(.[,6:ncol(.)])/32)*100) <= 10) %>%
+  # replace the NA values
+  replace(is.na(.), "?") %>%
+  # gather the loci names into a new column
+  tidyr::gather(., Loci, Val, -(1:5), na.rm = FALSE) %>%
+  # remove the ".1" from the end of loci names
+  dplyr::mutate(Loci = gsub("\\.[0-9]*$","", Loci)) %>%
+  # group by all variables except the lovi values
+  dplyr::group_by(across(1:6)) %>%
+  # join loci values and separate by ":"
+  dplyr::summarise(Val = paste(Val[!(is.na(Val)|Val=="")], collapse=":")) %>%
+  # make loci names column headings again
+  tidyr::spread(Loci, Val)%>%
+  # ungroup
+  ungroup() %>%
+  # rename the ID column
+  dplyr::rename(ID = Lines.Loci) %>%
+  # get rid of the - male in ID columns
+  dplyr::mutate(ID = gsub("- male","", ID)) %>%
+  # arrange the data frame
+  dplyr::arrange(Long, Lat)
+```
+
+## Create Population Groupings
+
+We lump together populations that are within 10 km of each other because the coarsest Ocean General Circulation Model (OGCM) we use is ~9 km resolution. Here we create buffers and merge them together to get our groupsing for the downstream analysis.
+
+```{r, Create Populations}
+# make the population groups
+Population.Groups <- Population.Data %>%
+  # select coordinates
+  dplyr::select(Lat, Long) %>%
+  # get unique entries for buffers
+  unique(.) %>% 
+  # convert population data to simple feature.
+  sf::st_as_sf(x = .,
+               coords = c("Long", "Lat"),
+               crs = "+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0") %>%
+  sf::st_transform(., crs = "+proj=laea +lat_0=37.32 +lon_0=-113.04 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs") %>%
+  # make 10km buffer
+  sf::st_buffer(., dist = 10000) %>%
+  # make valid
+  sf::st_make_valid(.) %>%
+  # combine areas with overlapping buffers
+  sf::st_union(.) %>%
+  # make the object valid
+  sf::st_make_valid(.) %>%
+  # cast to a polygon
+  sf::st_cast(., "POLYGON") %>%
+  # make a spatial
+  sf::as_Spatial(.) 
+```
+
+## Assign Population Numbers
+
+We use our population groupings to assign the population number back to the genetic data for downstream analysis.We then rename the populations base on where they are.
+
+```{r, Population Assignment}
+
+# assign the populations to the genetic data and filter out locations with less than 10 samples
+Population.Genetic.Data <- Population.Data %>%
+  # convert population data to simple feature.
+  sf::st_as_sf(x = .,
+               coords = c("Long", "Lat"),
+               crs = "+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0") %>%
+  # spatial join to polygon to assign the population ID
+  sf::st_join(x = .,
+              y = (sf::st_as_sf(Population.Groups,
+                               coords = c("Longitude", "Latitude"),
+                               crs = "+proj=laea +lat_0=37.32 +lon_0=-113.04 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs") %>%
+                     sf::st_transform(., crs = "+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0")  %>%
+                     cbind(., Population_ID = 1:20)),
+              join = st_intersects,
+              left = FALSE) %>%
+  # convert to data frame with geometry column
+  as.data.frame(.) %>%
+  # split geometry to lat and long
+  tidyr::separate(., col = geometry, into = c("Longitude", "Latitude"), sep = ",") %>%
+  # extract number 
+  dplyr::mutate(Longitude = tidyr::extract_numeric(Longitude),
+                Latitude = tidyr::extract_numeric(Latitude)) %>%
+  # move the population Id column.
+  dplyr::relocate(c(Population_ID), .after = ID) %>%
+  # move columns around
+  dplyr::relocate(c(Longitude, Latitude, REGION, Year), .before = ID) %>%
+  # change numbers to acronyms
+  dplyr::mutate(Population_ID = dplyr::case_when(Population_ID == 1 ~ "UH",
+                                                 Population_ID == 2 ~ "RH",
+                                                 Population_ID == 3 ~ "TC",
+                                                 Population_ID == 4 ~ "LC",
+                                                 Population_ID == 5 ~ "TA",
+                                                 Population_ID == 6 ~ "NC",
+                                                 Population_ID == 7 ~ "LK",
+                                                 Population_ID == 8 ~ "UK",
+                                                 Population_ID == 9 ~ "EI",
+                                                 Population_ID == 10 ~ "SS",
+                                                 Population_ID == 11 ~ "EG",
+                                                 Population_ID == 12 ~ "SL",
+                                                 Population_ID == 13 ~ "FL",
+                                                 Population_ID == 14 ~ "LB",
+                                                 Population_ID == 15 ~ "VR",
+                                                 Population_ID == 16 ~ "BB",
+                                                 Population_ID == 17 ~ "CC",
+                                                 Population_ID == 18 ~ "TB",
+                                                 Population_ID == 19 ~ "IR",
+                                                 Population_ID == 20 ~ "NS")) %>%
+  # group
+  dplyr::group_by(Population_ID) %>%
+  # remove populations with less than 10 individuals
+  dplyr::filter(n() >= 10) %>%
+  # ungroup
+  dplyr::ungroup(.)
+
+# The acroynmes represent where the samples are from. NS = New Symerna, EG = Everglades, LB = Lower Bogue, EI = Exuma Island, FL = Fort Lauderdale, IR = Indian River, UK = Upper Keys, SL = Saint Lucie, VR = Vero Beach, LC = Long Caye, TC = Twin Cayes, TA = Turneffe Atoll, SS = San Salvador, CC = Charlotte County, BB = Bunche Beach, LK = Lower Keys, UH = Utila Honduras, RH = Roatan Honduras, NC = Northern Caye, TB = Tampa Bay
+
+```
+
+## Temporal Spread of Genetic Data
+
+```{r, Genetic Data across Time}
+Genetic.Data.Time.Table <- Population.Genetic.Data %>%
+  # group by year and populaiton
+  dplyr::group_by(Population_ID, Year) %>%
+  # count
+  dplyr::count()
+
+```
+
+## Convert Genetic Data
+
+Here we convert our genetic data from into a genid object.
+```{r, Convert Genetic Data}
+
+# make genind object for population genetic analysis used in the Pairwise Comparison
+Population.Genetic.Data.genid <- Population.Genetic.Data %>%
+  dplyr::select(-(1:6)) %>% # get the columns we need
+  adegenet::df2genind(X = .,
+                      sep = ":",
+                      ncod = NULL,
+                      ind.names = Population.Genetic.Data$ID,
+                      loc.names = NULL,
+                      pop = Population.Genetic.Data$Population_ID,
+                      NA.char= "?",
+                      ploidy = 2,
+                      type = "codom",
+                      strata = NULL,
+                      hierarchy = NULL)
+```
+
+# Population Genetics
+
+Below is our code to get our population genetic summary statistics, estimate population structure, evaluate genetic differentiation, and estimate directional migration.
+
+## Hardy–Weinberg Equilibrium
+
+We calculate Hardy–Weinberg Equilibrium (HWE) to evaluate if any loci should be removed from the analysis. We test it with no subgrouping and by population. Because rivulus is a can both self-fertilize and outcross, we expect to depart from HWE. However, we do not remove a locus unless it is out of HWE in all the populations per previous work with mixed-mating species.
+
+```{r, HWE}
+# test for Hardy-Weinberg equilibrium
+HWE.Total <- round(pegas::hw.test(Population.Genetic.Data.genid, B = 1000, digits = 3))
+
+# test for Hardy-Weinberg equilibrium across the populations
+Population.HWE.test <- dplyr::left_join(data.frame(sapply(adegenet::seppop(Population.Genetic.Data.genid),
+                                                          function(ls) pegas::hw.test(ls, B = 1000)[,4])) %>% #run a mc permutation test
+                                            # convert the loci names from the rows to a column
+                                            tibble::rownames_to_column(., var = "Loci") %>%
+                                            # gather to make the data long
+                                            tidyr::gather(., "Population", "MC", -Loci),
+                                            # run a chi-sq  test
+                                            data.frame(sapply(adegenet::seppop(Population.Genetic.Data.genid),
+                                                          function(ls) pegas::hw.test(ls, B = 0)[,3])) %>%
+                                            # convert the loci names from the rows to a column
+                                            tibble::rownames_to_column(., var = "Loci") %>%
+                                            # gather to make the data long
+                                          tidyr::gather(., "Population", "Chi", -Loci)) %>%
+  # make two new column the account for multiple testing
+  dplyr::mutate(MC.fdr = p.adjust(MC, method = "fdr"),
+                Chi.fdr = p.adjust(Chi, method = "fdr"))
+
+# General inference: No locus is out of HWE in all populations so all loci were retained. We expected to be out of HWE because they are selfing.
+```
+
+## Population Genetic Diversity
+
+We use heirfstat and popgenreport to get measure of genetic diversity
+
+```{r, Genetic diversity with Heirfstat}
+# get basic stats
+Population.Genetic.Diversity <- hierfstat::basic.stats(data = hierfstat::genind2hierfstat(Population.Genetic.Data.genid),
+                                                       diploid = TRUE, digits = 2) 
+#get observed heterozygosity
+Pop.Ho <- as.data.frame(Population.Genetic.Diversity$Ho) %>%
+  # get mean
+  dplyr::summarise_all(mean)
+
+#get expected heterozygosity
+Pop.Hs <- as.data.frame(Population.Genetic.Diversity$Hs) %>%
+  # get mean
+  dplyr::summarise_all(mean)
+
+# get allelic richness
+Population.Allelic.Richness <- PopGenReport::allel.rich(Population.Genetic.Data.genid)
+```
+## Population Structure
+
+We acknowledge that the idea of a "true K" is not biologically reasonable. Therefore, we evaluate population structure in multiple ways and discuss their results not in the context of a "true K" but the most appropriate K for the biological questions. 
+
+### DAPC
+
+First, we run a DAPC to get a rand of K values to test. We do not use DAPC to get a specific K value because of the recent work on the reproducability of DAPC and the number of PC axes to include. While the recommended K-1 PC axes suggestion is well intended, we do not have a prior estimate of K to use. Therefore, we run DAPC with K one through sixty with all the variation to determine the best range of K to test in subsequent methods
+
+```{r, DAPC}
+
+# find clusters using DAPC with 100% of the variance explained.
+DAPC <- adegenet::find.clusters(Population.Genetic.Data.genid, max.n.clust = 60, pca.select = "percVar", perc.pca = 100, stat = c("BIC"))
+
+# The results showed three significant inflection points: K = 12, 22, and 30. After K = 10 is the first significant increase in BIC. K= 22 is the point at which BIC seems to start to plateau out and K= 30 is the the plateau The object has been set to 12.
+```
+
+### Structure-Like Programs
+
+Because the BIC from the DAPC seems to asymtope at around K = 30, we evaluated K 5 through 30 in TESS3, sNMF, STRUCTURE, and InStruct. STRUCTURE and InStruct are run in the command line. We ran STRUCTURE on an HPC; therefore, the code to run it is located an a parmfile within the project. InStruct was ran on a local machine using the terminal in R; therefore, the code is included.
+
+#### Structure
+
+##### Structure File
+Here we create a data frame in a STRUCTURE format file format for STRUCTURE.
+
+```{r, Structure Data Frame}
+# make a structure data file format
+Riv.STR.Data <- Population.Genetic.Data %>% 
+  # parse the loci to two rows for STR format
+  tidyr::separate_rows(.,c(7:38), sep = ":" ) %>% 
+  # replace ? with -9
+  dplyr::mutate_at(vars(7:38), ~ as.numeric(dplyr::if_else(. == "?", "-9", .))) %>%
+  # get rid of unnecessary columns
+  dplyr::select(-REGION, -Year)
+```
+
+We export the file for STRUCTURE. We also used the file with PDGSpider to convert to Bayesass file formats. 
+```{r, write STRUCTURE}
+
+# write the structure formatted data to tab delimited file.  
+write.table((Riv.STR.Data %>%
+              dplyr::select(-Latitude, -Longitude)), file = paste(getwd(), "Data/Riv_STR.txt", sep = "/"), sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE)
+
+#### Use this to pad the ID column to make IDs all same length for migrate
+write.table((Riv.STR.Data %>%
+              dplyr::select(-Latitude, -Longitude)) %>%
+              dplyr::mutate(ID = stringi::stri_pad_right(ID, 10, 0)), file = paste(getwd(), "Data/Riv_STR_migrate.txt", sep = "/"), sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE)
+```
+
+#### InStruct
+
+We run InStruct for 5 chains and evaluate convergence for K five through thirty.
+
+```{terminal, InStruct, eval = FALSE}
+
+# The code runs Instruct. You must first navigate to the InStruct Folder
+InStruct -d Riv_STR.txt -o Riv_Instruct_Out.txt -N 1120 -L 32 -K 17 -lb 1 -a 1 -x 0 -w 0 -p 2 -m -9 -af 0 -mm 5.0e11 -v 1 -ik 1 -kv 5 30 -c 3 -u 100000 -b 50000 -t 10 -g 1 -r 2000 -cf Riv_InStruct_converg.txt -e 0 -pi 0 -pf 0 -j 1000 -df 1 -sl 0.9 -s 13 42 22
+```
+
+
+
+#### sNMF
+
+sNMF takes a geno file. Therefore, we first convert from STR files to geno and run sNMF.
+
+```{r, sNMF}
+
+#convert the structure data to a geno object for LEA.
+LEA::struct2geno("Data/Riv_STR.txt", ploidy = 2, FORMAT = 2, extra.row = 1, extra.column = 2)
+
+#runs snmf for our populations with values 5 through 30
+Rivulus_snmf <- LEA::snmf("Data/Riv_STR.txt.geno", K = 5:30, entropy = TRUE, repetitions = 20,  alpha = 100, project = "new", iterations = 100000, ploidy = 2, seed = 42)
+
+#plots the cross entropy against number of populations.
+plot(Rivulus_snmf, cex = 1.2, col = "lightblue", pch = 19)
+# K = 17 is when it starts to plateau, but K = 22 is the lowest cross-entropy
+  
+```
+
+#### TESS3
+
+Here we convert the STR data frame to a TESS format and run TESS for 5 through 30.
+
+```{r, Pop Gen Structure in R}
+
+# get tess formatted data
+Rivulus_Tess_Data <- Riv.STR.Data %>%
+  # move extra columns to beginning of data frame
+  dplyr::relocate(., c(ID, Population_ID), .before = Longitude) %>%
+  # make the structure format to tess3 format
+  tess3r::tess2tess3(., FORMAT = 2, diploid = TRUE, extra.column = 2)
+
+# run tes3 with population 5 - 30 and 20 reps each with 100000 max iterations  
+Rivulus_Tess_Results <- tess3r::tess3(X = Rivulus_Tess_Data$X, coord = Rivulus_Tess_Data$coord, K = 5:30, ploidy = 2, rep = 20, max.iteration = 100000)   
+
+```
+
+#### AMOVA
+
+```{rm AMOVA}
+
+# make data frame with strata for AMOVA
+Population.Genetic.Data.Strata <- Population.Genetic.Data %>%
+  # add regions
+  dplyr::mutate(Region = dplyr::case_when(Population_ID %in% c("CC", "TB") ~ "West Florida",
+                                          Population_ID %in% c("EG", "FL", "LK", "NS", "UK") ~ "South Florida",
+                                          Population_ID %in% c("IR", "NS", "SL") ~ "East Florida",
+                                               Population_ID %in% c("EI", "LB", "SS") ~ "Bahammas",
+                                               Population_ID %in% c("TA", "TC", "NC", "UH", "LC") ~ "Central_America")) %>%
+  # group
+  dplyr::group_by(Latitude, Longitude) %>%
+  # get location ID
+  dplyr::mutate(Location = dplyr::cur_group_id()) %>%
+  # ungroup
+  dplyr::ungroup()
+
+# make genid object for AMOVA
+Population.Genetic.Data.Strata.Genind <- Population.Genetic.Data.Strata %>%
+  # select columns needed
+  dplyr::select(c(7:38)) %>%
+  # make genind object
+  adegenet::df2genind(X = .,
+                      sep = ":",
+                      ncod = NULL,
+                      ind.names = Population.Genetic.Data.Strata$ID,
+                      loc.names = NULL,
+                      pop = Population.Genetic.Data.Strata$Population_ID,
+                      NA.char= "?",
+                      ploidy = 2,
+                      type = "codom",
+                      strata = (Population.Genetic.Data.Strata %>%
+                                  dplyr::select(Region, Population_ID, Location)),
+                      hierarchy = NULL)
+  
+# run AMOVA
+AMOVA <- poppr::poppr.amova(Population.Genetic.Data.Strata.Genind,
+                            hier = ~Region/Population_ID/Location,
+                            clonecorrect = FALSE,
+                            within = TRUE,
+                            dist = NULL,
+                            freq = TRUE,
+                            correction = "quasieuclid",
+                            filter = FALSE,
+                            threshold = 0,
+                            algorithm = "farthest_neighbor",
+                            threads = 6,
+                            missing = "loci",
+                            cutoff = 0.1,
+                            quiet = FALSE,
+                            method = c("ade4"),
+                            nperm = 999)
+# run significance test for AMOVA
+AMOVA.Sign <- ade4::randtest(AMOVA,
+                             nrepet = 999)
+```
+
+
+## Gene Flow
+
+We use mmod to calculate genetic distance metrics. mmod take a genid object.
+
+
+### Genetic Differentation
+
+We calculate the pairwise genetic distance metrics Nei's Gst (gst), Hedricks G`st (Gst), and Jost's D (D).
+
+```{r, Pairwise Genetic Distance}
+# make object for polystat to get Rst
+genambig.object <- poppr::as.genambig(Population.Genetic.Data.genid) %>%
+  # fill in missing ploidy
+  polysat::estimatePloidy(.)
+
+# repeat info
+polysat::Usatnts(genambig.object) <- c(2,3,4,3,2,4,2,4,4,4,4,4,4,4,4,4,4,4,4,4,2,4,4,5,4,2,4,2,4,2,2,4)
+
+# get pairwise genetic distances
+Pairwise.Pop.DF <- mmod::pairwise_Gst_Hedrick(Population.Genetic.Data.genid, linearized = FALSE) %>% #Gst
+  # make matrix
+  as.matrix(.) %>%
+  # convert to data frame
+  reshape2::melt(., value.name = "value") %>%
+  # label with genetic distance metric
+  dplyr::mutate(GD = "Gst") %>%
+  # bind with gst
+  rbind(.,#get Nei gst
+        mmod::pairwise_Gst_Nei(Population.Genetic.Data.genid, linearized = FALSE) %>% # gst
+          # make matrix
+          as.matrix(.) %>%
+          # convert to data frame
+          reshape2::melt(., value.name = "value") %>%
+          # label with genetic distance metric
+          dplyr::mutate(GD = "gst")) %>%
+  # bind with D
+  rbind(.,# get D
+        (mmod::pairwise_D (Population.Genetic.Data.genid, linearized = FALSE) %>% # D
+           # make matrix
+           as.matrix(.) %>%
+           # convert to data frame
+           reshape2::melt(., value.name = "value") %>%
+           # label with genetic distance metric
+           dplyr::mutate(GD = "D"))) %>%
+  # bind with Rst
+  rbind(.,# get Rst
+        (polysat::calcPopDiff((polysat::simpleFreq(genambig.object, 
+                                                   samples = polysat::Samples(genambig.object), 
+                                                   loci = polysat::Loci(genambig.object))), 
+                              metric = "Rst", global = FALSE, bootstrap = FALSE, object = (genambig.object)) %>% # Rst
+           # make matrix
+           as.matrix(.) %>%
+           # convert to data frame
+           reshape2::melt(., value.name = "value") %>%
+           # label with genetic distance metric
+           dplyr::mutate(GD = "Rst"))) %>%
+  # rename columns
+  dplyr::rename(Pop1 = Var1,
+                Pop2 = Var2) 
+
+```
+
+
+
+### Directional Migration
+
+We calculate directional migration with the R package Bayesass, and migrate-n.
+
+#### Bayesass
+
+We calculate Bayesass estimates using a package in R. To do so, we first create a function to run the program.
+
+```{r, Bayesass Function}
+
+# function to run Bayesass
+Bayes.fun <- function(ls){
+  # required library
+  library(flowR)
+  
+  # set the directory
+  setwd(ls$wd)
+
+  #run bayesass  
+  Bayesass.run <- flowR::BayesAss(infile = "Riv_Bayesass.txt", outfile = ls$outfile, iter = format(30000000, scientific = F) ,
+                                  burn = format(10000000, scientific = F), interval = 10000, deltaM = .085, deltaA = 0.25, 
+                                  deltaF = 0.18, seed = round(runif(1,0,10000)), other = "-t", exe = "BA3Win64MSAT.exe")
+
+  # read in results
+  Bayesass.Results <- flowR::load_ba_results(ls$outfile)
+
+  # return a list of results
+  return(list(Run = Bayesass.run,
+              Results = Bayesass.Results))
+}
+
+```
+
+We next create a list to distribute across multiple cores so that we can run Bayesass in parallel and run the program with the function. 
+
+```{r, Bayeass}
+# make a list object ot run Bayesass in parallel
+Bayesass.Parm.List <- list(
+  list(wd = "Results/Bayesass/Chain1",
+       outfile = "Riv_bayesass_out_1.txt", 
+       seed = round(runif(1,0, 1000))),
+  list(wd = "Results/Bayesass/Chain2", 
+       outfile = "Riv_bayesass_out_2.txt", 
+       seed = round(runif(1,0, 1000))),
+  list(wd = "Results/Bayesass/Chain3",
+       outfile = "Riv_bayesass_out_3.txt", 
+       seed = round(runif(1,0, 1000))),
+  list(wd = "Results/Bayesass/Chain4",
+       outfile = "Riv_bayesass_out_4.txt", 
+       seed = round(runif(1,0, 1000))),
+  list(wd = "Results/Bayesass/Chain5",
+       outfile = "Riv_bayesass_out_5.txt", 
+       seed = round(runif(1,0, 1000))))
+
+# make a cluster 
+clst <- parallel::makeCluster(5,  outfile = "Results/Bayesass/Log.txt")
+
+# run Bayesass in parallel
+Bayesass.runs <- parallel::parLapply(cl = clst, X = Bayesass.Parm.List, fun = Bayes.fun)
+
+# stop the cluster
+parallel::stopCluster(clst)
+
+# remove the cluster object
+rm(clst)
+```
+
+Finally, we read the results into a data frame. Convergence was assessed in Tracer.
+
+```{r, Bayesass Data Frame}
+# read in the multiple chains of results and format it into a data frame.
+Bayeass.Results <- Bayesass.runs[[1]]$Results %>%
+  # convert to data frame
+  as.data.frame(.) %>%
+  # labe the chain
+  dplyr::mutate(Chain = 1) %>%
+  # make long
+  tidyr::pivot_longer(., cols = (5:6), names_to = "Stat", values_to = "Value") %>%
+  # join with second chain
+  dplyr::full_join(., as.data.frame(Bayesass.runs[[2]]$Results) %>%
+                     dplyr::mutate(Chain = 2) %>%
+                     tidyr::pivot_longer(., cols = (5:6), names_to = "Stat", values_to = "Value")) %>%
+  # join with third chain
+  dplyr::full_join(., as.data.frame(Bayesass.runs[[3]]$Results) %>%
+                     dplyr::mutate(Chain = 3) %>%
+                     tidyr::pivot_longer(., cols = (5:6), names_to = "Stat", values_to = "Value")) %>%
+  # join with fourth chain
+  dplyr::full_join(., as.data.frame(Bayesass.runs[[4]]$Results) %>%
+                     dplyr::mutate(Chain = 4) %>%
+                     tidyr::pivot_longer(., cols = (5:6), names_to = "Stat", values_to = "Value")) %>%
+  # join with fifth chain
+  dplyr::full_join(., as.data.frame(Bayesass.runs[[5]]$Results) %>%
+                     dplyr::mutate(Chain = 5) %>%
+                     tidyr::pivot_longer(., cols = (5:6), names_to = "Stat", values_to = "Value")) %>%
+  # rename
+  dplyr::rename(Pop1 = data.p1,
+                Pop2 = data.p2) %>%
+  # get population labels and format
+  dplyr::mutate(across(3:4, ~ dplyr::case_when(. == 0 ~ "TC",
+                                               . == 1 ~ "TA",
+                                               . == 2 ~ "LC",
+                                               . == 3 ~ "NC",
+                                               . == 4 ~ "UH",
+                                               . == 5 ~ "TB",
+                                               . == 6 ~ "CC",
+                                               . == 7 ~ "LK",
+                                               . == 8 ~ "EG",
+                                               . == 9 ~ "UK",
+                                               . == 10 ~ "NS",
+                                               . == 11 ~ "IR",
+                                               . == 12 ~ "SL",
+                                               . == 13 ~ "FL",
+                                               . == 14 ~ "LB",
+                                               . == 15 ~ "EI",
+                                               . == 16 ~ "SS"))) %>%
+  # reformat stat
+  dplyr::mutate(Stat = dplyr::case_when(Stat == "data.value" ~ "Mean",
+                                        Stat == "data.sd" ~ "SD")) %>%
+  # get rid of extra columns
+  dplyr::select(-populations.id, -populations.label) %>%
+  # group
+  dplyr::group_by(Pop1, Pop2, Stat) %>%
+  # summarise
+  dplyr::summarise(Value = mean(Value))
+
+
+
+
+Bayeass.Results.0.01 <- Bayeass.Results %>%
+  dplyr::filter(Stat == "Mean" & Value >= 0.005)
+```
+
+
+# Abiotic Variables
+
+## CMS
+
+We use the connectivity-modeling-system (CMS) to estimate ocean current mediated connectivity by simulating an ocean current environment and releasing particles that can represent larva, eggs ,or other propagules. CMS requires ocean current data (nest files), two parameter files, and a release file. It generates either netCDF or ASCII files with the location of each particle at the designated time step. Here we generate the release files and process the output.
+
+### Generate Release Files
+
+The release file is a tab delimited text file with 9 columns (polygon, longitude, latitude, depth, number, year, month, day, and second). Polygon is used with the seascape module if particles are allowed to settle. Even if the particles are not allowed to settle, the polygon column is still required and must be an integer. Longitude, latitude, and depth columns represent the location of the particle release location both geographically and vertically. The number is the number of particles released at that specific combination of location and time. If there is no horizontal diffusivity coefficient, all the particles released at the same location and time will follow the same trajectory. The year, month, day, and second columns dictate the time of release. Particles cannot be released over land, and if they are, CMS will not notify you of the issue. CMS dictates a particle is on land if two of the closest eight points are dictated as land my the nest files.
+
+To get an accurate representation of ocean current connectivity, 1000 locations were selected and 5 particles released form each location at a random point every day for 10 years. Because locations could not be over land, we had to troubleshoot release locations using the example HYCOM files from the specific experiments used in our simulations and additional buffer zones. Therefore, the following code requires importing the HYCOM data, sampling the points, and creating the release files.
+#### Release Points
+
+##### HYCOM Data
+
+CMS enables users to use different nest files that are different in resolution. We used two HYCOM experiments (GOM 50.1 & GLBu 0.08). The GOM 50.1 is only the Gulf of Mexico but is available at a 1/25° resolution, while the GLBu 0.08 is global but only at a 1/12° resolution. Here we import sample netCDF files invert them so that the land mask is not equal to one, convert them to polygons, and add a 5 km buffer to them. We then use them later to filter out locations that CMS would dictate as land. 
+
+
+```{r, HYCOM data}
+
+# get netcdf, convert to polygon, and calculate the buffer
+GOM <- raster::raster(paste(getwd(), "Data/Sample_HYCOM/hycom_gomu_501_2012010100_t000.nc", sep = "/"), varname = "water_v") %>%
+  # crop the the study extent to make sure that cells outside the domain are not retained inappropriately 
+  raster::crop(., raster::extent(c(xmin = -98.1 , xmax = -76.5 , ymin = 18 , ymax = 32))) %>%
+  # invert the raster so that the land mask is the only cells with data
+  raster::calc(., fun = function(x){
+    if(is.na(x[1])){
+      return(1)}
+    else{ return(NA)}}) %>%
+  # convert to polygon
+  raster::rasterToPolygons(., dissolve = TRUE) %>%
+  # convert to sf object
+  sf::st_as_sf(x = .,
+               coords = c("Long", "Lat"),
+               crs = "+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0") %>%
+  # project for the buffer
+  sf::st_transform(., crs = "+proj=laea +lat_0=37.32 +lon_0=-113.04 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs") %>%
+  # calculate the 5 km buffer
+  sf::st_buffer(., dist = 5000) %>%
+  # unproject because CMS take lat/long
+  sf::st_transform(., crs = "+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0")
+  
+# get netcdf, convert to polygon, and calculate the buffer
+GBLu <- raster::raster(paste(getwd(), "Data/Sample_HYCOM/hycom_GLBu0.08_191_1995080100_t000.nc", sep = "/"), varname = "water_v") %>%
+  # crop the the study extent to make sure that cells outside the domain are not retained inappropriately 
+  raster::crop(., raster::extent(c(xmin = -91 , xmax = -76 , ymin = 18 , ymax = 32))) %>%
+  # invert the raster so that the land mask is the only cells with data
+  raster::calc(., fun = function(x){
+    if(is.na(x[1])){
+      return(1)}
+    else{ return(NA)}}) %>%
+  # convert to polygon
+  raster::rasterToPolygons(., dissolve = TRUE) %>%
+  # convert to sf object
+  sf::st_as_sf(x = .,
+               coords = c("Long", "Lat"),
+               crs = "+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0") %>%
+  # project for the buffer
+  sf::st_transform(., crs = "+proj=laea +lat_0=37.32 +lon_0=-113.04 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs") %>%
+  # calculate the 5 km buffer
+  sf::st_buffer(., dist = 5000) %>%
+  # unproject because CMS take lat/long
+  sf::st_transform(., crs = "+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0")
+```
+
+##### Sample Locations
+
+Here we use the population polygons to sample release locations for CMS. This step required troubleshooting to determine the appropriate buffer to add to the population group polygons to ensure that the particles were not considered over land and not overlapping with an adjacent population.
+
+```{r, Release Locations}
+
+# Get a data frame of points along the edge each polygon group for release points
+Population.Points <- Population.Groups %>%
+  # convert to sf
+  sf::st_as_sf(x = .,
+               coords = c("X", "Y"),
+               crs = "+proj=laea +lat_0=37.32 +lon_0=-113.04 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs") %>%
+  # make 2km buffer to push the points farther from the coast
+  sf::st_buffer(., dist = 2000) %>%
+  # make valid
+  sf::st_make_valid(.) %>%
+  # combine areas with overlapping buffers
+  sf::st_union(.) %>%
+  # make the object valid
+  sf::st_make_valid(.) %>%
+  # cast to a polygon
+  sf::st_cast(., "POLYGON") %>%
+  # transform to lat/long cms takes lat/long
+  sf::st_transform(., crs = "+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0") %>%
+  # get points along the edge
+  sf::st_segmentize(., dfMaxLength = 0.1) %>%
+  # convert to coordinates
+  sf::st_coordinates(.) %>%
+  # make a data frame
+  as.data.frame(.) %>%
+  # select important columns
+  dplyr::select(X, Y, L2) %>%
+  # rename the population ID column
+  dplyr::rename(Population_ID = L2) %>%
+  # reduce to third decimal
+  dplyr::mutate(X = format(round(X, 3), nsmall = 3),
+                Y = format(round(Y, 3), nsmall = 3)) %>%
+  # get unique points
+  dplyr::distinct(.) %>%
+  # make sf object
+  sf::st_as_sf(.,
+               coords = c("X", "Y"),
+               crs = "+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0") %>%
+  # add location columns and columns that indicate if a point is within the land mask for each HYCOM experiment 
+  dplyr::mutate(GOM = lengths(sf::st_within(., GOM)),
+                GBLu = lengths(sf::st_within(., GBLu)),
+                Longitude = sf::st_coordinates(.)[,1],
+                Latitude = sf::st_coordinates(.)[,2]) %>%
+  # convert to data frame
+  as.data.frame(.) %>%
+  # filter out locations by the finest resolution nest that over over land
+  dplyr::filter((Latitude > 18 & Latitude < 32 & Longitude > -98.1 & Longitude < -76.5 & GOM == 0) |
+                  (Latitude < 18 & GBLu == 0) | (Longitude >= -76.5 & GBLu == 0)) %>%
+  # select important columns
+  dplyr::select(Longitude, Latitude, Population_ID)
+```
+
+##### Create Release files
+
+Here we use the locations to create the release files. We first create a master release file data frame that includes all the years.
+
+```{r, Release Data Frame}
+
+# set the seed for reproducability 
+set.seed(42)
+
+# make file of release points that are over water
+Release.Points <- Population.Points %>%
+  # convert the longitude to same format as output for join
+  dplyr::mutate(Longitude = 360+Longitude) %>%
+  # get rid of population that did not have enough samples
+  dplyr::filter(Population_ID !=2 & Population_ID != 15 & Population_ID != 16) %>%
+  # group
+  dplyr::group_by(Population_ID) %>%
+  # sample 1000 locations randomly
+  dplyr::sample_n(1000, replace = TRUE) %>%
+  # replicate each row by the total number of days from the start of the simulation to the end.
+  dplyr::slice(rep(row_number(), (10*12*31))) %>%
+  # add columns for CMS and fill Year column
+  dplyr::mutate(Depth = 0,
+                Number = 10,
+                Year = rep(2000:2009, each = (1000*12*31))) %>%
+  # group
+  dplyr::group_by(Population_ID, Year) %>%
+  # fill Month column
+  dplyr::mutate(Month = rep(1:12, each = (1000*31))) %>%
+  # group
+  dplyr::group_by(Population_ID, Year, Month) %>%
+  # fill day column
+  dplyr::mutate(Day = rep(1:31, each = 1000)) %>%
+  # ungroup
+  dplyr::ungroup() %>%
+  # fill second with a random time
+  dplyr::mutate(Second = round(runif(nrow(.), 0, 86400))) %>%
+  # filter out all the days that do not exist and Feb 29th because the CMS software ignores it anyways
+  dplyr::filter((Month %in% c(1,3,5,7,8,10,12) & Day <= 31) | (Month %in% c(4,6,9,11) & Day <= 30) | (Month == 2 & Day <= 28)) %>%
+  # make sure columns are in the correct order for CMS
+  dplyr::relocate(Population_ID, .before = Longitude)
+```
+
+Even with an HPC, it was more effective to run each year seperatley. Therefore, we write a release file for each year.
+
+```{r, write files}
+
+# write release file for 2000
+write.table(Release.Points %>%
+               dplyr::filter(Year == 2000),file = paste(getwd(), "CMS/Input/Release_Points_2000.txt", sep = "/"),quote = FALSE, sep = '\t', col.names = FALSE, row.names = FALSE)
+
+# write release file for 2001
+write.table(Release.Points %>%
+               dplyr::filter(Year == 2001),file = paste(getwd(), "CMS/Input/Release_Points_2001.txt", sep = "/"),quote = FALSE, sep = '\t', col.names = FALSE, row.names = FALSE)
+
+# write release file for 2002
+write.table(Release.Points %>%
+               dplyr::filter(Year == 2002),file = paste(getwd(), "CMS/Input/Release_Points_2002.txt", sep = "/"),quote = FALSE, sep = '\t', col.names = FALSE, row.names = FALSE)
+
+# write release file for 2003
+write.table(Release.Points %>%
+               dplyr::filter(Year == 2003),file = paste(getwd(), "CMS/Input/Release_Points_2003.txt", sep = "/"),quote = FALSE, sep = '\t', col.names = FALSE, row.names = FALSE)
+
+# write release file for 2004
+write.table(Release.Points %>%
+               dplyr::filter(Year == 2004),file = paste(getwd(), "CMS/Input/Release_Points_2004.txt", sep = "/"),quote = FALSE, sep = '\t', col.names = FALSE, row.names = FALSE)
+
+# write release file for 2005
+write.table(Release.Points %>%
+               dplyr::filter(Year == 2005),file = paste(getwd(), "CMS/Input/Release_Points_2005.txt", sep = "/"),quote = FALSE, sep = '\t', col.names = FALSE, row.names = FALSE)
+
+# write release file for 2006
+write.table(Release.Points %>%
+               dplyr::filter(Year == 2006),file = paste(getwd(), "CMS/Input/Release_Points_2006.txt", sep = "/"),quote = FALSE, sep = '\t', col.names = FALSE, row.names = FALSE)
+
+# write release file for 2007
+write.table(Release.Points %>%
+               dplyr::filter(Year == 2007),file = paste(getwd(), "CMS/Input/Release_Points_2007.txt", sep = "/"),quote = FALSE, sep = '\t', col.names = FALSE, row.names = FALSE)
+
+# write release file for 2008
+write.table(Release.Points %>%
+               dplyr::filter(Year == 2008),file = paste(getwd(), "CMS/Input/Release_Points_2008.txt", sep = "/"),quote = FALSE, sep = '\t', col.names = FALSE, row.names = FALSE)
+
+# write release file for 2009
+write.table(Release.Points %>%
+               dplyr::filter(Year == 2009),file = paste(getwd(), "CMS/Input/Release_Points_2009.txt", sep = "/"),quote = FALSE, sep = '\t', col.names = FALSE, row.names = FALSE)
+```
+
+### Post Processesing 
+```{r, CMS Post-Processing Functions}
+# the function processes the CMS output files
+CMS.Processing.Function <- function(pathlist, polygons, timestep, releasepoints){
+  
+  library(dplyr)
+  library(sf)
+  library(sfheaders)
+  library(tidyverse)
+  
+  # read in the population polygon and convert to sf
+  Populations <- sf::st_as_sf(polygons,
+                               coords = c("X", "Y"),
+                               crs = "+proj=laea +lat_0=37.32 +lon_0=-113.04 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs") %>%
+    # transform
+    sf::st_transform(., crs = "+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0") %>%
+    # add population ID
+    cbind(., Population_ID = (1:20))
+  
+  releasepoints <- releasepoints %>%
+    # get only important columns
+    dplyr::select(Population_ID, Longitude, Latitude) %>%
+    # get only distinct values
+    distinct(.) %>%
+    # convert lat and long to character for join
+    dplyr::mutate( Longitude = as.character(Longitude),
+                   Latitude = as.character(Latitude))
+  
+  #a function to assign the sources
+  Assignment.Fun <- function(path, polygon, points){
+    
+  # read in the trajectory file
+  CMS.Output <- readr::read_table(path, 
+                                  col_names = c("Location", "Particle", "Time", "Longitude", "Latitude", "Depth", "Distance", "Exit_Code", "Release_Date"))  %>%
+    # remove the columns we do not need
+    dplyr::select(-Depth, -Exit_Code, -Release_Date)
+  
+  # assign the sources
+  Assigned.Release <- CMS.Output %>%
+    # filter to retain only the first release point
+    dplyr::filter(Time == 0) %>%
+    # convert the Latitude and longitude to character vectors for the left join
+    dplyr::mutate(Longitude = as.character(Longitude),
+                  Latitude = as.character(Latitude)) %>%
+    # join with release locations
+    dplyr::left_join(., points) %>%
+    # select the variables we need
+    dplyr::select(Location, Population_ID, Particle) %>%
+    # relabel the source column
+    dplyr::rename(Source = Population_ID) %>%
+    # convert location and particle to characters for joining
+    dplyr::mutate(Location = as.character(Location),
+                  Particle = as.character(Particle))
+  
+  # Assign the sink and join to the source
+  Source.Sink <- CMS.Output %>%
+    # get particle that have moved
+    dplyr::filter(Time != 0) %>%
+    # convert to sf object
+    sf::st_as_sf(.,
+               coords = c("Longitude", "Latitude"),
+               crs = "+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0") %>%
+    # join it with polygons
+    sf::st_join(x = .,
+                y = polygon,
+              join = st_intersects,
+              left = TRUE) %>%
+    # convert to data frame
+    sfheaders::sf_to_df(., fill = TRUE) %>%
+    # select important columns
+    dplyr::select(-sfg_id, -point_id) %>%
+    # rename columns
+    dplyr::rename(Longitude = x,
+                 Latitude = y,
+                 Sink = Population_ID) %>%
+    # convert location and particle to character for left join
+    dplyr::mutate(Location = as.character(Location),
+                  Particle = as.character(Particle)) %>%
+    # join with the sources
+    dplyr::left_join(., Assigned.Release) %>%
+    # get rid of rows that do not have a sink
+    dplyr::filter(!is.na(Sink))
+  
+  return(Source.Sink)
+  }
+  
+  # calculate connectivity values
+  Connectivity.Values <- lapply(pathlist, FUN = Assignment.Fun, polygon = Populations, points = releasepoints) %>% # apply function to all files
+    # bind the lists together
+    bind_rows(.) %>%
+    # group by unique particles for each source sink relationship
+    dplyr::group_by(Source, Sink, Location, Particle) %>%
+    # arrange by time
+    dplyr::arrange(Time, by.group = TRUE) %>%
+    # calculate the difference between times
+    dplyr::mutate(Time_diff = Time - lag(Time)) %>%
+    # mutate to get connectivity values
+    dplyr::mutate(Time_diff = replace(Time_diff, Time_diff != timestep, timestep), # retain only time steps that are consecutive and if they are not give it a value of the timestep
+                  Time = (sum(Time_diff, na.rm = TRUE)), # get total amount of time in the polygon
+                  Distance = min(Distance)) %>% # get min distance traveled
+    # get distinction combinations to not count particles twice
+    dplyr::distinct(Source, Sink, Location, Particle, Distance, Time, .keep_all = TRUE) %>%
+    # group by source sink
+    dplyr::group_by(Source, Sink) %>%
+    # summarise 
+    dplyr::summarise(n = dplyr::n_distinct(Location, Particle), # number of particles
+                     Distance = mean(Distance), # average distance
+                     Time = mean(Time, na.rm = TRUE)) %>% # mean time within polygon
+    # ungroup
+    dplyr::ungroup(.)
+
+return(Connectivity.Values)}
+
+# the function calculate the shortest path between two populations by multiplying the probabilities
+Shortest.Path.Product.Function <- function(df, variable, asymmetric){
+  library(igraph)
+  library(tidyverse)
+  library(reshape2)
+  
+  # set up the variable to be used as column name
+  variable <- ggplot2::enquo(variable)
+  
+  # reformat the data frame for the graph
+  df <- df %>%
+    # rename columns
+    dplyr::rename(From = Pop1,
+                  To = Pop2,
+                  weight = !!variable) %>%
+    # select columns needed
+    dplyr::select(From, To, weight) %>%
+    # do not keep any weights that are zero
+    dplyr::filter(weight > 0)
+  
+  # make undirected graph
+  Graph <- igraph::graph_from_data_frame(df, directed = asymmetric, vertices = NULL)
+  
+  # log the weights if not 0 and multiply by negative 1
+  E(Graph)$weight <- -1*ifelse(E(Graph)$weight != 0, log(E(Graph)$weight), 0)
+  
+  # get shortest path, multiply by -1 and exponent to get the same value as multiplying probabilities
+  res <- exp(igraph::shortest.paths(Graph)*-1)
+  
+  # set diagnol to zero
+  diag(res) <- 1
+  
+  # make list to host the number of nodes 
+  Nodes.list <- list()
+  
+  # iterate across all nodes
+  for(i in 1:length(V(Graph))){
+    
+    # make a data frame of the number of nodes between each sest of nodes
+    Nodes.list[[i]] <- data.frame(Pop1 = names(V(Graph)[i]), # label populations
+                 Pop2 = names(V(Graph)), # label populations
+                 # get number of nodes
+                 Nodes = lengths(igraph::get.shortest.paths(Graph, V(Graph)[i], V(Graph),  mode = "all",
+                         weights = E(Graph)$weight, output = "vpath")$vpath))}
+  
+  # set up data frame of values
+  Shortest.Path.DF <- as.data.frame(as.table(res)) %>%
+    # rename columns
+    dplyr::rename(Pop1 = Var1,
+                  Pop2 = Var2) %>%
+    # join with number of nodes
+    dplyr::left_join(.,dplyr::bind_rows(Nodes.list)) %>%
+    # # divide by number of nodes - 1 unless it was a self comparison (1)
+    dplyr::mutate(Freq = Freq/(dplyr::if_else(Nodes > 1, Nodes-1, as.double(Nodes)))) %>%
+    # get rid of nodes column
+    dplyr::select(-Nodes) %>%
+    # relabel freq
+    dplyr::rename(!!variable := Freq)
+  
+  return(Shortest.Path.DF)
+}
+```
+
+```{r, CMS Post-Processing}
+# processes the ocean current data
+Ocean.Connectivity <- CMS.Processing.Function(pathlist = list.files(paste(getwd(), "CMS/Output/", sep ="/"), recursive  = TRUE, full.names = TRUE), polygons = Population.Groups, releasepoints = Release.Points, timestep = 1800) %>%
+  # convert to characters
+  dplyr::mutate(across(1:2, ~ as.character(.))) %>% 
+  # rename populations 
+  dplyr::mutate(across(1:2, ~ dplyr::case_when(. == "1" ~ "UH",
+                                               . == "2" ~ "RH",
+                                               . == "3" ~ "TC",
+                                               . == "4" ~ "LC",
+                                               . == "5" ~ "TA",
+                                               . == "6" ~ "NC",
+                                               . == "7" ~ "LK",
+                                               . == "8" ~ "UK",
+                                               . == "9" ~ "EI",
+                                               . == "10" ~ "SS",
+                                               . == "11" ~ "EG",
+                                               . == "12" ~ "SL",
+                                               . == "13" ~ "FL",
+                                               . == "14" ~ "LB",
+                                               . == "15" ~ "VR",
+                                               . == "16" ~ "BB",
+                                               . == "17" ~ "CC",
+                                               . == "18" ~ "TB",
+                                               . == "19" ~ "IR",
+                                               . == "20" ~ "NS"))) %>%
+  # filter out populations not analyzed
+  dplyr::filter(Source != "RH" & Source != "VR" & Source != "BB" & Sink != "RH" & Sink != "VR" & Sink != "BB")
+```
+
+```{r, symmetric connectivity formating}
+
+# make the symmetric ocean current connectivity data frame
+Symmetric.OC <- Ocean.Connectivity %>%
+  # group if by populations regardless of order
+  dplyr::group_by(Pop1 = pmin(Source, Sink), Pop2 = pmax(Source, Sink)) %>%
+  # get total time
+  dplyr::summarise(Time = sum(Time*n)) %>%
+  # ungroup
+  dplyr::ungroup(.) %>%
+  # filter out diagonal
+  dplyr::filter(Pop1 != Pop2) %>%
+  # scale to get probabilities relative to total connectivity
+  dplyr::mutate(Time = Time/sum(Time)) %>% 
+  # join with stepping stone model while calculating the stepping stone values
+  dplyr::full_join(., lapply(X = c("Time"), #, "n.total"),
+                            FUN = Shortest.Path.Product.Function, df = ., asymmetric = FALSE) %>% # get shortest path values
+                     purrr::reduce(dplyr::full_join, by = c("Pop1", "Pop2")) %>% # make a data frame
+                     dplyr::filter(Pop1 != Pop2) %>% # filter out diagonal
+                     dplyr::rename(Time.Step = Time)) %>%
+  # mutate to only fill if the column is a zero on NA
+  dplyr::mutate(Time = dplyr::if_else(is.na(Time) | Time == 0, Time.Step, Time)) %>%
+  # select important columns
+  dplyr::select(Pop1, Pop2, Time)
+```
+## Distance
+
+Rivulus are unlikely to travel over land. Therefore, we use distance over water as our distance measure.To do so, we first get centroids of all the populations, a land mask, and create a cost transition matrix. We then wrote a function that iterates across all points to get the shortest distance avoiding the land mask.
+
+### Centroids
+
+We get the centroid of each population.
+
+```{r, Centroids}
+# get centroids for calculating the distance over water
+Centroids <- sf::st_as_sf(Population.Groups,
+                                   coords = c("X", "Y"),
+                                   crs = "+proj=laea +lat_0=37.32 +lon_0=-113.04 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs") %>%
+  # get centroids
+  sf::st_centroid(.) %>%
+  # transform
+  sf::st_transform(., crs = "+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0") %>%
+  # get coordinates
+  sf::st_coordinates(.) 
+```
+
+### Land.mask
+
+We get a land mask from the world data we imported for maps.
+
+```{r, Land mask}
+# make land mask
+Land.mask <- world %>%
+  # crop
+  sf::st_crop(., xmin = -100, xmax = -65, ymin = 0, ymax = 32) %>%
+  # convert to raster
+  raster::rasterize(., (raster::raster(nrow = 1000, ncol = 1000, ext=extent(-100, -65, 0, 32))))
+```
+
+### Transition object
+
+We create a transition object from the land mask.
+
+```{r, transition object}
+# make transition object
+Water.Cost <- Land.mask %>%
+  # make water 1 and land 999
+  raster::calc(., fun = function(x){
+    if(is.na(x[1])){
+      return(1)}
+    else{ return(999)}}) %>%
+  # make into transition
+  gdistance::transition(., function(x) 1/mean(x), 16) %>%
+  # correct
+  gdistance::geoCorrection(., type = "c", scl = FALSE)
+
+```
+
+### Ocean distance function
+
+We write a function to iterate across all points and get the distance over water.
+
+```{r, Ocean distance function}
+# function to get distances over water
+Ocean.Distance.Fun <- function(points, cost_raster, landmask){
+  
+  library(gdistance)
+  library(gissr)
+  library(tidyverse)
+  library(raster)
+  
+  # empty list
+  Distance <- list()
+  
+  # loop to get distances
+  for(i in 1:nrow(points)){
+    # get cost raster for the point
+    Cost <- gdistance::accCost(cost_raster, points[i,]) %>%
+      # mask land
+      raster::mask(., landmask, inverse = TRUE)
+    
+    # get shortest path and calcualte distance
+    Distance[[i]] <- gdistance::shortestPath(cost_raster, points[i,], points[-i,], output = "SpatialLines") %>%
+      # get distance
+      gissr::sp_length(.) %>%
+      # make into data frame
+      data.frame(Pop1 = i,
+               Pop2 = (1:nrow(points))[-i],
+               Distance = .)
+  }
+  
+  return(dplyr::bind_rows(Distance))
+}
+
+```
+
+### Ocean Distance
+
+We get the distance over marine habitat for all populations.
+
+```{r, Ocean distances}
+Ocean.Distance.df <- Ocean.Distance.Fun(Centroids, Water.Cost, Land.mask) %>%
+  # make population acronyms to match the genetic data
+  dplyr::mutate(across(1:2, ~ dplyr::case_when(. == 1 ~ "UH",
+                                               . == 2 ~ "RH",
+                                               . == 3 ~ "TC",
+                                               . == 4 ~ "LC",
+                                               . == 5 ~ "TA",
+                                               . == 6 ~ "NC",
+                                               . == 7 ~ "LK",
+                                               . == 8 ~ "UK",
+                                               . == 9 ~ "EI",
+                                               . == 10 ~ "SS",
+                                               . == 11 ~ "EG",
+                                               . == 12 ~ "SL",
+                                               . == 13 ~ "FL",
+                                               . == 14 ~ "LB",
+                                               . == 15 ~ "VR",
+                                               . == 16 ~ "BB",
+                                               . == 17 ~ "CC",
+                                               . == 18 ~ "TB",
+                                               . == 19 ~ "IR",
+                                               . == 20 ~ "NS")))
+
+```
+
+
+# Analysis
+
+## Symmetric
+
+We use symmetric ocean current data with genetic distance metrics to test for isolation by distance and isolation by ocean currents. Therefore, we first join the genetic and abiotic data together. We then run Pearson's correlations against all predictors to examine for multicollinearity. Finally, we split the data frame by genetic distance metric to create a list that we iterate over in our custom function. We use custom functions to run mantel tests, partial mantel tests, and maximum population likelihood effects (MPLE) models. 
+
+### Formating
+
+Here we format our data for analysis.
+
+#### Joining Symmetric
+
+First we have to join the genetic and abiotic data.
+ 
+```{r, Join Symmetric}
+# make symmetric data frame
+Pairwise.Env.Symmetric.DF <- Pairwise.Pop.DF %>%
+  # add distance to the data frame
+  dplyr::left_join(., Ocean.Distance.df) %>%
+  # get ;pg distance
+  dplyr::mutate(Distance = log10(Distance)) %>%
+  # add the ocean current connectivity
+  dplyr::left_join(., Symmetric.OC) %>%
+  # arrange
+  dplyr::arrange(Pop1, Pop2) %>%
+  # group to by GD and populations
+  dplyr::group_by(pmin(Pop1, Pop2), pmax(Pop1, Pop2), GD) %>%
+  # get mean because the numbers are slightly off in decimal places but the discrepancy is not uniform
+  dplyr::mutate(across(where(is.numeric), ~ mean(.x, na.rm = FALSE))) %>%
+  # ungroup
+  dplyr::ungroup(.) %>%
+  # add regions
+  dplyr::mutate(Region.Pop1 = dplyr::case_when(Pop1 %in% c("CC", "EG", "FL", "IR", "LK", "NS", "SL", "TB", "UK") ~ "Florida",
+                                               Pop1 %in% c("EI", "LB", "SS") ~ "Bahammas",
+                                               Pop1 %in% c("TA", "TC", "NC", "UH", "LC") ~ "Central_America"),
+                Region.Pop2 = dplyr::case_when(Pop2 %in% c("CC", "EG", "FL", "IR", "LK", "NS", "SL", "TB", "UK") ~ "Florida",
+                                               Pop2 %in% c("EI", "LB", "SS") ~ "Bahammas",
+                                               Pop2 %in% c("TA", "TC", "NC", "UH", "LC") ~ "Central_America")) %>%
+  # linearize the Fst analogs and take square root of time
+  dplyr::mutate(Time = (Time)^(1/2),
+                value = value/(1-value)) %>%
+  # select columns we need in the correct order
+  dplyr::select(Pop1, Region.Pop1, Pop2 ,Region.Pop2, GD, value, Time, Distance)
+```
+
+#### Symmetric Multicolinearity
+
+Here we test for high correlations between variables to know if we need to remove any.
+
+```{r, Symmetric Correlations}
+# calculate the correlation
+Symmetric.Cor <- Pairwise.Env.Symmetric.DF %>%
+  # get rid of diagonals for correlations
+  dplyr::filter(Pop1 != Pop2) %>%
+  # select columns we need
+  dplyr::select(Distance, Time) %>%
+  # get the unique values because we have multiple genetic distances
+  dplyr::distinct(.) %>%
+  # make into matrix
+  as.matrix(.) %>%
+  # get correlations
+  cor(.)
+```
+
+#### Symmetric List
+
+We split the data frame by genetic distance metric for analysis.
+
+```{r, Symmetric Data List}
+# make symmetric data into list to iterate over
+Pairwise.Env.Symmetric.List <- Pairwise.Env.Symmetric.DF %>%
+  # split by GD
+  split(., f = Pairwise.Env.Symmetric.DF$GD) %>%
+  # add diagonals to all the data frames and remove GD
+  lapply(., function(x) dplyr::select(x,-GD))
+
+```
+
+### Mantel
+
+We test for isolation by distance and isolation by ocean currents with mantel and partial mantel tests. We create a functions repeat these tests for all genetic distance metrics and combinations.
+
+#### Mantel Functions
+
+We write functions for the mantel test and partial mantel test using the codist package.
+
+```{r, Symmetric Mantel function}
+# function to run the mantel test between all genetic distance metrics and distance that converts the results to a data frame
+Mantel.fun <- function(list, N.perm) {
+  # libraries
+  library(tidyverse)
+  library(dplyr)
+  library(tidyr)
+  library(reshape2)
+  library(ecodist)
+  
+  
+  # make list
+  Mantel.Test.Result.List <- list()
+  
+  # make a list
+  DF.list <- list()
+  
+  for (i in 1:length(list)) {
+    
+    # get a vector of distances
+    value <- as.vector(as.dist(reshape2::acast(list[[i]], Pop1 ~ Pop2, value.var = "value")))
+    
+    # get a vector of distances
+    Distance <- as.vector(as.dist(reshape2::acast(list[[i]], Pop1 ~ Pop2, value.var = "Distance")))
+    
+    # make data frame
+    DF.list[[i]] <- data.frame(value = value,
+                               Distance = Distance)
+    
+    # run the mantel test
+    Mantel.Test.Result <- ecodist::mantel(value ~ Distance, data = DF.list[[i]], nperm = N.perm, nboot = 10000, pboot = 0.9, cboot = 0.95)
+    
+    # make list
+    Mantel.Test.Result.List[[i]] <- data.frame(R = Mantel.Test.Result[1],
+                                               P.value.less = Mantel.Test.Result[2],
+                                               P.value.greater = Mantel.Test.Result[3],
+                                               P.value.two = Mantel.Test.Result[4],
+                                               Lower.CI = Mantel.Test.Result[5],
+                                               Upper.CI = Mantel.Test.Result[6],
+                                               CI = 95)
+    }
+  
+  names(Mantel.Test.Result.List) <- names(list)
+  
+  # make a data frame of the mantel test results
+  Mantel.Results.Df <- dplyr::bind_rows(Mantel.Test.Result.List, .id = "Genetic.Distance") %>%
+  dplyr::mutate(Formula = "value ~ Distance")
+  
+  return(Mantel.Results.Df)
+}
+
+```
+
+```{r, Symmetric Parital Mantel Function}
+# a function to run partial mantel tests
+Partial.Mantel.fun <- function(df, N.perm){
+  library(tidyverse)
+  library(dplyr)
+  
+  # function to format the data
+  Symmetric.Format.fun <- function(df){
+    library(reshape2)
+    
+    # make empty list
+    matrix.list <- list()
+    
+    # make empty vector
+    name <- vector()
+    
+    # loop over columns
+    for(i in 1:(ncol(df)-2)) {
+      
+      # get vector of distances
+      matrix.list[[i]] <- as.vector(as.dist(reshape2::acast(df, Pop1 ~ Pop2, value.var = (colnames(df[(i+2)])))))
+      
+      # name the list
+      names(matrix.list)[[i]] <-colnames(df[(i+2)])
+     }
+    
+    # convert to data frame
+    Formatted.DF <- as.data.frame(matrix.list)
+    
+    return(Formatted.DF)
+  
+}
+  
+  # format data
+  Formatted.DF <- Symmetric.Format.fun(df)
+  
+  # make data frame of comparisons
+  Formulas <- as.data.frame(t(combn((colnames((Formatted.DF %>%                               
+                                                 dplyr::select(-value)))), 2))) %>% # gets combinations of all variables
+    # filters out those that do not have distances as the Z matrix
+    dplyr::filter(V1 != "Distance"  & V2 == "Distance")  %>%
+    # moves the variable
+    dplyr::mutate(Response = "value", .before = "V1") %>% 
+    # unite the predictors
+    tidyr::unite("Predictors", 2:3, sep = " + ", remove = TRUE) %>%
+    # unit the formula
+    tidyr::unite("Formula", 1:2, sep = " ~ ", remove = TRUE)
+  
+  # make empty list
+  Partial.Mantel.Result.List <- list()
+  
+  # iterate over the forumalas
+  for(i in 1:nrow(Formulas)){
+    
+    # run Partial Mantel test
+    Partial.Mantel.Test.Result <- ecodist::mantel(as.formula(Formulas[i,]), 
+                                                 data = Formatted.DF, nperm = N.perm, nboot = 10000, pboot = 0.9, cboot = 0.95)
+    
+    # make mantel data frames
+    Partial.Mantel.Result.List[[i]] <- data.frame(R = Partial.Mantel.Test.Result[1],
+                                                 P.value.less = Partial.Mantel.Test.Result[2],
+                                                 P.value.greater = Partial.Mantel.Test.Result[3],
+                                                 P.value.two = Partial.Mantel.Test.Result[4],
+                                                 Lower.CI = Partial.Mantel.Test.Result[5],
+                                                 Upper.CI = Partial.Mantel.Test.Result[6],
+                                                 CI = 95)
+  }
+  
+  # name the elements in the list
+  names(Partial.Mantel.Result.List) <- Formulas[,1]
+  
+  # bind the list to make a data frame
+  Partial.Mantel.Result.DF <- dplyr::bind_rows(Partial.Mantel.Result.List, .id = "Formula")
+  
+  return(Partial.Mantel.Result.DF)
+
+}
+
+```
+
+#### Run Mantel Tests
+
+Here we run all the mantel and partial mantel tests
+
+```{r, run Symmetric Mantel Tests}
+
+# run mantel and partial mantel tests
+Mantel.Results <- Mantel.fun((lapply(Pairwise.Env.Symmetric.List, function(x) x %>%
+                                            dplyr::select(-Region.Pop1, -Region.Pop2))), N.perm = 100000) %>%
+  dplyr::bind_rows(., (lapply((lapply(Pairwise.Env.Symmetric.List, function(x) x %>%
+                                        dplyr::select(-Region.Pop1, -Region.Pop2))),
+                              Partial.Mantel.fun, N.perm = 100000) %>%
+                         # bind into data frame
+                         dplyr::bind_rows(., .id = "Genetic.Distance")))
+
+# General inferences: 
+```
+
+### MLPE
+
+Because there is a heated debate on the use of mantel tests in ecology and population genetics, we also use a maximum likelihood population effects model to test for the importance of ocean currents.
+
+#### MLPE Function
+
+We write a function that runs mple models on either our symmetric or asymmetric data with either maximum likelihood or restricted maximum likelihood for all combinations of our models including two way and three way interactions. It then calculates AIC and AICc for each model.
+
+```{r,MLPE function}
+
+# function to fun MLPE
+MLPE.fun <- function(df, method, symmetric){
+  
+  # librarys for formatting
+  library(tidyverse)
+  library(dplyr)
+
+  # function to format a data frame for the mple model with symmetric ocean current data
+  Symetric.DF.Format.fun <- function(df){
+    
+    # library to get the matrix
+    library(reshape2)
+    library(tidyverse)
+    
+    # make empty matrix list
+    matrix.list <- list()
+    
+    #make name vector
+    name <- vector()
+    
+    # iterate across rows
+    for(i in 1:(ncol(df)-2)) {
+      
+      # every element of the matrix list is a vector of distance values for every  variable
+      matrix.list[[i]] <- as.vector(as.dist(t(reshape2::acast(df, Pop1 ~ Pop2, value.var = (colnames(df[(i+2)]))))))
+      
+      # name each matrix
+      names(matrix.list)[[i]] <-colnames(df[(i+2)])
+     }
+    
+    # get an example matrix to pull the population names from
+    Example.Matrix <- reshape2::acast(df, Pop1 ~ Pop2, value.var = (colnames(df[3])))
+    
+    # make the matrix list a data frame and add the population values
+    Formatted.DF <- as.data.frame(matrix.list) %>%
+      # get the population labels
+      cbind(., data.frame(Pop2 = rownames(Example.Matrix)[row(Example.Matrix)[lower.tri(Example.Matrix)]],
+                          Pop1 = colnames(Example.Matrix)[col(Example.Matrix)[lower.tri(Example.Matrix)]])) %>%
+      # reorder for data frame
+      dplyr::relocate(c(Pop1, Pop2), .before = value)
+    
+    #return the data frame
+    return(Formatted.DF)
+  
+  }
+  
+  # use symmetric or asymmetric method
+  if (symmetric == TRUE) {
+    # run formatting function on data frame
+    Formatted.DF <- Symetric.DF.Format.fun(df) %>%
+      # scale variables
+      dplyr::mutate(across(4:last_col(), ~ (.x - mean(.x))/sd(.x)))
+    } else {
+      # format data frame
+      Formatted.DF <- df %>%
+        # scale variables
+        dplyr::mutate(across(4:last_col(), ~ (.x - mean(.x))/sd(.x)))
+      }
+  
+  # make a true/false matrix to iterate across for all models
+  # the number of columns should be the number of predictors you want to evaluate
+  Predictors <- expand.grid(c(TRUE,FALSE), 
+                          c(TRUE,FALSE)) %>%
+    # remove the last row where there is not predictors
+    dplyr::filter_all(., dplyr::any_vars(. == TRUE)) %>%
+    # convert to matrix
+    as.matrix(.)
+  
+  # make models data frame we do this twice to get the models with and without the interaction terms and bind them together/
+  Models.DF <-apply(Predictors, 1, function(x) paste((colnames(Formatted.DF %>%
+                                                                 dplyr::select(-c(1:3)))[x]),
+                                                     collapse = " + ")) %>% # make formulas
+    # make data frame
+    data.frame(Formulas = .) %>%
+    # make the models with interaction terms
+    dplyr::mutate(Formulas = dplyr::if_else(stringr::str_detect(Formulas, "\\+"),
+                                            paste("(", Formulas, ")^2", sep = ""), Formulas)) %>%
+    # bind with non interaction term formulas
+    rbind(., (apply(Predictors, 1, function(x) paste((colnames(Formatted.DF %>%
+                                                                 dplyr::select(-c(1:3)))[x]), collapse = " + ")) %>%
+                # make data frame
+                data.frame(Formulas = .))) %>%
+    # remove duplicates
+    dplyr::distinct(.) %>%
+    # make final formulas
+    dplyr::mutate(Formulas = paste("value ~", Formulas, sep = " "))
+  
+  # make empty list
+  Models.Fit <- list()
+  
+  # run the models
+  for(i in 1:nrow(Models.DF)){
+  Models.Fit[[i]] <- nlme::gls(model = formula(Models.DF[i,1]),
+          correlation = corMLPE::corMLPE(form=~Pop1+Pop2),
+          data = Formatted.DF,
+          method = method)
+  }
+  
+  # name list elements
+  names(Models.Fit) <- Models.DF$Formulas
+  
+  # make model comparision data frame
+  Models.compare <- data.frame(K = sapply(Models.Fit, function(ls) attr(logLik(ls), "df")), # parameters
+                               AIC = sapply(Models.Fit, AIC)) %>% # AIC
+    dplyr::mutate(AICc = AIC + 2*K*(K + 1)/((nrow(Formatted.DF))-K+1)) %>% # AICc
+    dplyr::mutate(AICc.w = exp(-0.5*(AICc - min(.$AICc)))/sum(exp(-0.5*(AICc - min(.$AICc))))) %>% # wAIcc
+    # make formula columns
+    tibble::rownames_to_column(., "Formula")
+
+  # make results list
+  Results <- list(Models.Fit,
+                  Models.compare)
+
+}
+```
+
+Here we run the MPLE
+```{r, run symmetric MPLE}
+# run the MLPE model
+Symmetric.MLPE.ML.Results <- lapply((lapply(Pairwise.Env.Symmetric.List, function(x) x %>%
+                                              # remove columns we do not need
+                                              dplyr::select(-Region.Pop1, -Region.Pop2))), 
+                                    MLPE.fun, method = "ML", symmetric = TRUE)
+
+# get a list of the model comparisions
+Symmetric.MLPE.ML.Fixed.Compare <- lapply(Symmetric.MLPE.ML.Results, "[",2)
+
+# run MLPE with REML for parameter estimates
+Symmetric.MLPE.REML.Results <- lapply((lapply(Pairwise.Env.Symmetric.List, function(x) x %>%
+                                                # remove columns we do not need
+                                                dplyr::select(-Region.Pop1, -Region.Pop2))),
+                                      MLPE.fun, method = "REML", symmetric = TRUE)
+
+# plot
+plot(Symmetric.MLPE.ML.Results$Gst[[1]]$`value ~ (Time + Distance)^2`, abline = c(0,0))
+
+# plots histogram of residuals
+hist(residuals(Symmetric.MLPE.ML.Results$Gst[[1]]$`value ~ (Time + Distance)^2`))
+
+# plot qqplot
+car::qqPlot(residuals(Symmetric.MLPE.ML.Results$Gst[[1]]$`value ~ (Time + Distance)^2`))
+
+
+# plot
+plot(Symmetric.MLPE.ML.Results$D[[1]]$`value ~ (Time + Distance)^2`, abline = c(0,0))
+
+# plots histogram of residuals
+hist(residuals(Symmetric.MLPE.ML.Results$D[[1]]$`value ~ (Time + Distance)^2`))
+
+# plot qqplot
+car::qqPlot(residuals(Symmetric.MLPE.ML.Results$D[[1]]$`value ~ (Time + Distance)^2`))
+
+
+# plot
+plot(Symmetric.MLPE.ML.Results$gst[[1]]$`value ~ Distance`, abline = c(0,0))
+
+# plots histogram of residuals
+hist(residuals(Symmetric.MLPE.ML.Results$gst[[1]]$`value ~ Distance`))
+
+# plot qqplot
+car::qqPlot(residuals(Symmetric.MLPE.ML.Results$gst[[1]]$`value ~ Distance`))
+
+
+# plot
+plot(Symmetric.MLPE.ML.Results$Rst[[1]]$`value ~ (Time + Distance)^2`, abline = c(0,0))
+
+# plots histogram of residuals
+hist(residuals(Symmetric.MLPE.ML.Results$Rst[[1]]$`value ~ (Time + Distance)^2`))
+
+# plot qqplot
+car::qqPlot(residuals(Symmetric.MLPE.ML.Results$Rst[[1]]$`value ~ (Time + Distance)^2`))
+
+
+# get summary 
+summary(Symmetric.MLPE.REML.Results$D[[1]]$`value ~ (Time + Distance)^2`)
+# get confidence intervals
+nlme::intervals(Symmetric.MLPE.REML.Results$D[[1]]$`value ~ (Time + Distance)^2`)
+
+
+# get summary 
+summary(Symmetric.MLPE.REML.Results$D[[1]]$`value ~ Distance`)
+# get confidence intervals
+nlme::intervals(Symmetric.MLPE.REML.Results$D[[1]]$`value ~ Distance`)
+
+
+# get summary 
+summary(Symmetric.MLPE.REML.Results$D[[1]]$`value ~ Time + Distance`)
+# get confidence intervals
+nlme::intervals(Symmetric.MLPE.REML.Results$D[[1]]$`value ~ Time + Distance`)
+
+# get summary
+summary(Symmetric.MLPE.REML.Results$D[[1]]$`value ~ Time`)
+# get confidence intervals
+nlme::intervals(Symmetric.MLPE.REML.Results$D[[1]]$`value ~ Time`)
+
+
+
+# get summary
+summary(Symmetric.MLPE.REML.Results$Gst[[1]]$`value ~ (Time + Distance)^2`)
+# get confidence intervals
+nlme::intervals(Symmetric.MLPE.REML.Results$Gst[[1]]$`value ~ (Time + Distance)^2`)
+
+
+# get summary
+summary(Symmetric.MLPE.REML.Results$Gst[[1]]$`value ~ Distance`)
+# get confidence intervals
+nlme::intervals(Symmetric.MLPE.REML.Results$Gst[[1]]$`value ~ Distance`)
+
+
+# get summary
+summary(Symmetric.MLPE.REML.Results$Gst[[1]]$`value ~ Time + Distance`)
+# get confidence intervals
+nlme::intervals(Symmetric.MLPE.REML.Results$Gst[[1]]$`value ~ Time + Distance`)
+
+# get summary
+summary(Symmetric.MLPE.REML.Results$Gst[[1]]$`value ~ Time`)
+# get confidence intervals
+nlme::intervals(Symmetric.MLPE.REML.Results$Gst[[1]]$`value ~ Time`)
+
+
+# get summary
+summary(Symmetric.MLPE.REML.Results$gst[[1]]$`value ~ (Time + Distance)^2`)
+# get confidence intervals
+nlme::intervals(Symmetric.MLPE.REML.Results$gst[[1]]$`value ~ (Time + Distance)^2`)
+
+
+# get summary
+summary(Symmetric.MLPE.REML.Results$gst[[1]]$`value ~ Distance`)
+# get confidence intervals
+nlme::intervals(Symmetric.MLPE.REML.Results$gst[[1]]$`value ~ Distance`)
+
+
+# get summary
+summary(Symmetric.MLPE.REML.Results$gst[[1]]$`value ~ Time + Distance`)
+# get confidence intervals
+nlme::intervals(Symmetric.MLPE.REML.Results$gst[[1]]$`value ~ Time + Distance`)
+
+# get summary
+summary(Symmetric.MLPE.REML.Results$gst[[1]]$`value ~ Time`)
+# get confidence intervals
+nlme::intervals(Symmetric.MLPE.REML.Results$gst[[1]]$`value ~ Time`)
+
+
+# get summary
+summary(Symmetric.MLPE.REML.Results$Rst[[1]]$`value ~ (Time + Distance)^2`)
+# get confidence intervals
+nlme::intervals(Symmetric.MLPE.REML.Results$Rst[[1]]$`value ~ (Time + Distance)^2`)
+
+# get summary
+summary(Symmetric.MLPE.REML.Results$Rst[[1]]$`value ~ Distance`)
+# get confidence intervals
+nlme::intervals(Symmetric.MLPE.REML.Results$Rst[[1]]$`value ~ Distance`)
+
+# get summary
+summary(Symmetric.MLPE.REML.Results$Rst[[1]]$`value ~ Time`)
+# get confidence intervals
+nlme::intervals(Symmetric.MLPE.REML.Results$Rst[[1]]$`value ~ Time`)
+
+# get summary
+summary(Symmetric.MLPE.REML.Results$Rst[[1]]$`value ~ Time + Distance`)
+# get confidence intervals
+nlme::intervals(Symmetric.MLPE.REML.Results$Rst[[1]]$`value ~ Time + Distance`)
+```
+
+## Asymmetric 
+
+### Joining Asymmetric
+
+First we have to join the genetic and abiotic data
+
+```{r, asymmetric joining}
+
+# make asymmetric data frame
+Pairwise.Env.Asymmetric.DF <- Bayeass.Results %>%
+  # get the mean migration estimate
+  dplyr::filter(Stat == "Mean") %>%
+  # left join with the ocean distance
+  dplyr::left_join(., Ocean.Distance.df) %>%
+  # get the log10 of ocean distance
+  dplyr::mutate(Distance = log10(Distance)) %>%
+  # add the ocean current connectivity
+  dplyr::left_join(., (Ocean.Connectivity %>%
+                         # rename
+                     dplyr::rename(Pop1 = Source,
+                                   Pop2 = Sink,
+                                   n.total = n) %>%
+                       # get rid of ocean current distance
+                       dplyr::select(-Distance) %>%
+                       # scale to get probabilities relative to total connectivity
+                       dplyr::mutate(Time = (Time*n.total)/sum(Time*n.total)) %>%
+                       # join with network analysis
+                       dplyr::full_join(., lapply(X = c("Time"),
+                                                  FUN = Shortest.Path.Product.Function, df = ., asymmetric = TRUE) %>% # get shortest path values
+                                          purrr::reduce(dplyr::full_join, by = c("Pop1", "Pop2")) %>% # make a data frame
+                                          dplyr::filter(Pop1 != Pop2) %>% # filter out diagonal
+                                          dplyr::rename(Time.Step = Time)) %>% # rename
+                       # mutate the time to retain the nondirect path if there is no connectivity or NA
+                       dplyr::mutate(Time = dplyr::if_else(is.na(Time) | Time == 0, Time.Step, Time)) %>%
+                       dplyr::select(Pop1, Pop2, Time))) %>%
+  # arrange
+  dplyr::arrange(Pop1, Pop2) %>%
+  # add regions and square root time
+  dplyr::mutate(Region.Pop1 = dplyr::case_when(Pop1 %in% c("CC", "EG", "FL", "IR", "LK", "NS", "SL", "TB", "UK") ~ "Florida",
+                                               Pop1 %in% c("EI", "LB", "SS") ~ "Bahammas",
+                                               Pop1 %in% c("TA", "TC", "NC", "UH", "LC") ~ "Central_America"),
+                Region.Pop2 = dplyr::case_when(Pop2 %in% c("CC", "EG", "FL", "IR", "LK", "NS", "SL", "TB", "UK") ~ "Florida",
+                                               Pop2 %in% c("EI", "LB", "SS") ~ "Bahammas",
+                                               Pop2 %in% c("TA", "TC", "NC", "UH", "LC") ~ "Central_America")) %>%
+  # transform time
+  dplyr::mutate(Time = (Time)^(1/2)) %>%
+  # should be no NAs but replace with zero if there are
+  dplyr::mutate_if(is.numeric , replace_na, replace = 0) %>%
+  # rename
+  dplyr::rename(value = Value) %>%
+  # filter diagonal
+  dplyr::filter(Pop1 !=Pop2) %>% 
+  # ungroup
+  dplyr::ungroup(.) %>%
+  # transform value
+  dplyr::mutate(value = (value)^(1/4)) %>%
+  # select columns we need in the correct order
+  dplyr::select(Pop1, Region.Pop1, Pop2 ,Region.Pop2, value, Time, Distance)
+
+```
+
+### Asymetric Multicolinearity
+
+Here we test for high correlations between variables to know if we need to remove any.
+
+```{r, Symmetric Correlations}
+# calculate the correlation
+Asymmetric.Cor <- Pairwise.Env.Asymmetric.DF %>%
+  # get rid of diagonals for correlations
+  dplyr::filter(Pop1 != Pop2) %>%
+  # select columns we need
+  dplyr::select(Distance, Time) %>%
+  # get the unique values because we have multiple genetic distances
+  dplyr::distinct(.) %>%
+  # make into matrix
+  as.matrix(.) %>%
+  # get correlations
+  cor(.)
+```
+
+### MLPE - Asymmetric
+
+```{r, asymmetric MLPE}
+
+# run asymmetric MLPE with MR
+Asymmetric.MLPE.ML.Results <- MLPE.fun((Pairwise.Env.Asymmetric.DF %>%
+                                                       dplyr::select(-Region.Pop1, -Region.Pop2)),
+                                       method = "ML", symmetric = FALSE)
+
+# get the comparision
+Asymmetric.MLPE.ML.Fixed.Compare <- Asymmetric.MLPE.ML.Results[2]
+
+# get MPLE REML results
+Asymmetric.MLPE.REML.Results <- MLPE.fun((Pairwise.Env.Asymmetric.DF %>%
+                                                       dplyr::select(-Region.Pop1, -Region.Pop2)),
+                                       method = "REML", symmetric = FALSE)
+
+# plot
+plot(Asymmetric.MLPE.ML.Results[[1]]$`value ~ (Time + Distance)^2`, abline = c(0,0))
+
+# historgram of residuals 
+hist(residuals(Asymmetric.MLPE.ML.Results[[1]]$`value ~ (Time + Distance)^2`))
+
+# q-q plot
+car::qqPlot(residuals(Asymmetric.MLPE.ML.Results[[1]]$`value ~ (Time + Distance)^2`))
+
+# summary
+summary(Asymmetric.MLPE.REML.Results[[1]]$`value ~ (Time + Distance)^2`)
+# CI
+nlme::intervals(Asymmetric.MLPE.REML.Results[[1]]$`value ~ (Time + Distance)^2`)
+
+
+# summary
+summary(Asymmetric.MLPE.REML.Results[[1]]$`value ~ Time + Distance`)
+# CI
+nlme::intervals(Asymmetric.MLPE.REML.Results[[1]]$`value ~ Time + Distance`)
+
+# summary
+summary(Asymmetric.MLPE.REML.Results[[1]]$`value ~ Distance`)
+# CI
+nlme::intervals(Asymmetric.MLPE.REML.Results[[1]]$`value ~ Distance`)
+
+# summary
+summary(Asymmetric.MLPE.REML.Results[[1]]$`value ~ Time`)
+# CI
+nlme::intervals(Asymmetric.MLPE.REML.Results[[1]]$`value ~ Time`)
+
+```
+
+### Mantel - Asymmetric
+```{r, mantel function}
+# function to run mantel test on nonsymetric or nonsquare matricies
+Custom.Mantel.Function <- function(X.name, Y.name, Z.name, DF, N.perm, N.boot, L.boot, seed){
+  #library
+  library(boot)
+  
+  # set seed
+  set.seed(seed)
+  
+  # a mantels test function that does not require square or symmetric matrices
+  Custom.Univariant.mantel.function <- function(x, y, df, n.perm, n.boot, l.boot) {
+    
+    # get number of digits from machine
+    EPS <- sqrt(.Machine$double.eps)
+    
+    # make X vector
+    X.vector <- as.numeric(as.vector(df[[x]]))
+    
+    # scale the X vector
+    X.scaled <- scale(X.vector)
+    
+    # make Y vector
+    Y.vector <- as.numeric(as.vector(df[[y]]))
+    
+    # scale the Y vector
+    Y.scaled <- scale(Y.vector)
+    
+    # calculate correlation
+    statistic <- cor(X.vector, Y.vector, method = c("pearson"))
+    
+    # scale and take product
+    Z.stat <- X.scaled[1] * Y.scaled[1]
+    
+    # iterate through to get the cumulative sum of the products of scaled values
+    for(i in 2:length(X.vector)){
+      
+      # scale and take product
+      Z.stat[2] <- X.scaled[i] * Y.scaled[i]
+      
+      # get cumsum
+      Z.stat <- sum(Z.stat)
+		      }
+    
+    # average
+    Z.stat <- Z.stat/(length(X.vector))
+    
+    X.random <- list()
+      
+      for(i in (1 + length(X.random)):n.perm){
+        
+        # sample scaled X vector
+        X.random[[i]] <- sample(X.scaled, replace = TRUE)
+
+      }
+    
+    # make null vector to hold permuted correlations
+    Null.Z.stats <- vector()
+    
+    # run correlation on Y permuting X 
+    for(i in 1:n.perm){
+      
+      # make vector
+      Null.Z.stat <- vector()
+      
+      # reassign for loop
+      X.random.scaled <- X.random[[i]]
+      
+      # fill Null vector first product of scaled values
+      Null.Z.stat[1] <- X.random.scaled[1] * Y.scaled[1]
+      
+       # iterate across the vector
+      for(z in 2:length(X.vector)){
+        
+        # get product of scaled values
+        Null.Z.stat[2] <- X.random.scaled[z] * Y.scaled[z]
+        
+        # cumsum
+        Null.Z.stat <- sum(Null.Z.stat)
+        }
+      
+      # average
+      Null.Z.stats[i] <- Null.Z.stat/(length(X.vector))
+    }
+    
+    # get one-tailed p-value with null of r <= 0
+    p.val1 <- (sum(Null.Z.stats >= (Z.stat - EPS)) + 1)/(n.perm + 1)
+    
+    # get one-tailed p-value less null of r >= 0
+    p.val2 <- (sum(Null.Z.stats <= (Z.stat + EPS)) + 1)/(n.perm + 1)
+    
+    # get two-tailed p-value with null of  r = 0
+    p.val3 <- (sum(abs(Null.Z.stats) >= (abs(Z.stat) - EPS)) + 1)/(n.perm + 1)
+    
+    # make empty vector for bootstraps
+    boot.cor.all<- vector()
+    
+    # iterate through number of bootstraps
+    
+    for(i in 1:n.boot){
+      
+      # create index combinations only subsetting at the level designated above
+      index <- sample(1:length(X.vector), size = trunc(length(X.vector)*l.boot), replace = TRUE)
+      
+      # subset X
+      boot.X <- as.numeric(X.scaled[index])
+      
+      # subset Y
+      boot.Y <-  as.numeric(Y.scaled[index])
+      
+      # run correlation
+      boot.cor <- cor(boot.X, boot.Y, method = c("pearson"))
+      
+      # bind new value to old
+      boot.cor.all<- c(boot.cor.all, boot.cor)
+      }
+    
+    # get confidence interval
+    CI <- quantile(boot.cor.all, prob = c(0.25, 0.975), na.rm = TRUE)
+    
+    # get rid of the names on the values
+    names(CI) <- NULL
+    
+    # make result data frame
+    result <- data.frame(mantelr = statistic, 
+                         P.value.less = p.val1,
+                         P.value.greater = p.val2, 
+                         P.value.two = p.val3, 
+                         Lower.CI = CI[1], 
+                         Upper.CI = CI[2],
+                         Formula = paste(x, y, sep = " ~ "))
+    
+    # return results
+    return(result)
+    }
+  
+  # partial mantel test that does not require square of symmetric matrices
+  Custom.Partial.Mantel.Function <- function(x, y, z, df, n.perm, n.boot, l.boot) {
+    
+    # get number of digits from machine
+    EPS <- sqrt(.Machine$double.eps)
+    
+    # make X vector
+    X.vector <- as.numeric(as.vector(df[[x]]))
+    
+    # make Y vector
+    Y.vector <- as.numeric(as.vector(df[[y]]))
+    
+    # make Z vector
+    Z.vector <- as.numeric(as.vector(df[[z]]))
+    
+    # get residuals
+    XZ.residuals <- residuals(lm(X.vector ~ Z.vector))
+    
+    # scale the residuals
+    XZ.residuals.scaled <- scale(XZ.residuals)
+    
+    # get residuals
+    YZ.residuals <- residuals(lm(Y.vector ~ Z.vector))
+    
+    # scale the residuals
+    YZ.residuals.scaled <- scale(YZ.residuals)
+    
+    # calculate the statistic
+    statistic <- cor(XZ.residuals, YZ.residuals, method = c("pearson"))
+    
+    # scale and take product
+    Z.stat <- XZ.residuals.scaled[1] * YZ.residuals.scaled[1]
+    
+    # iterate through to get the cumulative sum of the products of scaled residuals 
+    for(i in 2:length(XZ.residuals.scaled)){
+      
+      # scale and take product
+      Z.stat[2] <- XZ.residuals.scaled[i] * YZ.residuals.scaled[i]
+      
+      # get cumsum
+      Z.stat <- sum(Z.stat)
+      }
+    
+    # average
+    Z.stat <- Z.stat/(length(XZ.residuals))
+    
+    # make null vector to hold permuted correlations
+    Null.Z.stats <- vector()
+
+    # permute through to get distribution of statistics
+    for(i in 1:n.perm){
+      
+      # make vector
+      Null.Z.stat <- vector()
+      
+      # randomize the x vector
+      YZ.residuals.scaled.random <- scale(sample(YZ.residuals, replace = TRUE))
+      
+      # get null product of random residuals
+      Null.Z.stat[1] <- YZ.residuals.scaled.random[1] * XZ.residuals.scaled[1]
+      
+      # iterate across the vector
+      for(p in 2:length(X.vector)){
+        
+        # get product of scaled residuals for null distribution
+        Null.Z.stat[2] <- YZ.residuals.scaled.random[p] * XZ.residuals.scaled[p]
+        
+        # cumsum
+        Null.Z.stat <- sum(Null.Z.stat)
+        }
+      
+      # average
+      Null.Z.stats[i] <- Null.Z.stat/(length(X.vector))
+      }
+    
+    # get one-tailed p-value with null of r <= 0
+    p.val1 <- (sum(Null.Z.stats >= (Z.stat)) + 1)/(n.perm + 1)
+    
+    # get one-tailed p-value less null of r >= 0
+    p.val2 <- (sum(Null.Z.stats <= (Z.stat)) + 1)/(n.perm + 1)
+    
+    # get two-tailed p-value with null of  r = 0
+    p.val3 <-  (sum(abs(Null.Z.stats) >= (abs(Z.stat))) + 1)/(n.perm + 1)
+    
+    # make empty vector for bootstraps
+    boot.cor.all<-NULL
+    
+    # iterate through number of bootstraps
+    for(i in 1:n.boot){
+      
+      # create index combinations only subsetting at the level designated above
+      index <- sample(1:length(X.vector), size = trunc(length(X.vector)*l.boot), replace = TRUE)
+      
+      # subset X
+      boot.X <- XZ.residuals[index]
+      
+      # subset Y
+      boot.Y <-  YZ.residuals[index]
+      
+      # run correlation
+      boot.cor <- cor(boot.X, boot.Y, method = c("pearson"))
+      
+      # bind new value to old
+      boot.cor.all <- c(boot.cor.all, boot.cor)
+      }
+    
+    # get confidence interval
+    CI <- quantile(boot.cor.all, prob = c(0.25, 0.975))
+    
+    # get rid of names
+    names(CI) <- NULL
+    
+    # make result data frame
+    result <- data.frame(mantelr = statistic, 
+                         P.value.less = p.val1, 
+                         P.value.greater = p.val2,
+                         P.value.two = p.val3, 
+                         Lower.CI = CI[1], 
+                         Upper.CI = CI[2],
+                         Formula = paste(x," ~ ", y, " + ", z, sep =""))
+    
+    # return results
+    return(result)
+  }
+  
+  # if there is no z variable we no a mantel test
+  if(is.na(Z.name)){
+    
+    # run mantel test
+    Results <- Custom.Univariant.mantel.function(x = X.name, y = Y.name, df = DF,
+                                                 n.perm = N.perm, n.boot = N.boot, l.boot = L.boot)
+    
+    # if there is a  variable, run a partial
+  } else {
+    
+    # run partial mantel test
+    Results <- Custom.Partial.Mantel.Function(x = X.name, y = Y.name, z = Z.name, df = DF, n.perm = N.perm, n.boot = N.boot, l.boot = L.boot)
+  }
+  
+  # return the results
+  return(Results)
+}
+
+Custom.Mantel.Validation.DF <- Pairwise.Env.Symmetric.List %>%
+  # format the data frame to match symmetric data
+  lapply(.,  function(x) x %>%
+           dplyr::filter(Pop1 != Pop2) %>%  # no diagonals
+           dplyr::select(value, Time, Distance) %>% # grab only number columns
+           dplyr::distinct(.)) %>% # make sure they are distinct
+  lapply(., function(x) Custom.Mantel.Function(X.name = "value",
+                                               Y.name = "Time",
+                                               Z.name = "Distance",
+                                               DF = x,
+                                               N.perm = 100000,
+                                               N.boot = 10000,
+                                               L.boot = 0.9,
+                                               seed = 42)) %>%
+  # bind into data frame
+  dplyr::bind_rows(., .id = "Genetic.Distance") %>%
+  # bind with single mantel results
+  rbind(., # apply the custom mantel test
+        (lapply(X = (Pairwise.Env.Symmetric.List %>%
+                   # format the data frame to match symmetric data
+                   lapply(.,  function(x) x %>%
+                            dplyr::filter(Pop1 != Pop2) %>%  # no diagonals
+                            dplyr::select(value, Time, Distance) %>% # grab only number columns
+                            dplyr::distinct(.))), # get distinct combinations 
+                FUN = Custom.Mantel.Function, X.name = "value",
+                Y.name = "Distance", Z.name = NA,
+                N.perm = 100000, N.boot = 10000, L.boot = 0.9, seed = 42) %>%
+           # bind into data frame
+           dplyr::bind_rows(., .id = "Genetic.Distance")))
+
+# run the custom mantel test on asymmetric data
+Asymmetric.Mantel.Results <- Pairwise.Env.Asymmetric.DF %>%
+  # filter diagonals
+  dplyr::filter(Pop1 != Pop2) %>%
+  # select numeric columns 
+  dplyr::select(where(is.numeric)) %>%
+  # run regular mantel test for isolation by distance
+  Custom.Mantel.Function(DF = .,  X.name = "value",
+                                Y.name = "Distance", Z.name = NA,
+                                N.perm = 100000, N.boot = 10000, L.boot = 0.9, seed = 42) %>%
+  # bind with partial mantel test
+  rbind(., (Pairwise.Env.Asymmetric.DF %>% 
+              dplyr::filter(Pop1 != Pop2) %>% # no diagonals
+              dplyr::select(where(is.numeric)) %>% # select numeric
+              # partial mantel test
+              Custom.Mantel.Function(X.name = "value",
+                                       Y.name = "Time",
+                                       Z.name = "Distance",
+                                       DF = .,
+                                       N.perm = 100000,
+                                       N.boot = 10000,
+                                       L.boot = 0.9,
+                                       seed = 42))) %>%
+  # get to data frame
+  dplyr::bind_rows(.)
+```
+
+# Figures
+
+## Population Structure
+
+### Clustering Comparsions
+
+#### Formatting
+
+#### DAPC
+```{r, DAPC Dataframe}
+DAPC.DF <- DAPC$Kstat %>%
+  as.data.frame(.) %>%
+  tibble::rownames_to_column(., "K") %>%
+  dplyr::mutate(K = tidyr::extract_numeric(K)) %>%
+  dplyr::rename_at(2, ~"BIC") %>%
+  dplyr::mutate(Method = factor("DAPC", levels = c("DAPC", "STRUCTURE", "InStruct", "TESS3", "sNMF")))
+```
+
+#### Cross Entropy
+
+```{r, sNMF Dataframe Function}
+sNMF.K.DF.Fun <- function(snmfProject,min.K, max.K){
+  library(LEA)
+  library(dplyr)
+  
+  list <- list()
+  
+  for(i in 1:(max.K-(min.K-1))) {
+    
+    k = (min.K:max.K)
+    
+    M <- mean(LEA::cross.entropy(snmfProject, K= k[i]))
+    
+    SD <- sd(LEA::cross.entropy(snmfProject, K= k[i]))
+    
+    MN <- min(LEA::cross.entropy(snmfProject, K= k[i]))
+    
+    list[[i]] <- data.frame(K = c(k[i]), Mean = c(M), StandardDev = SD, Min = MN)
+  }
+    
+  return(dplyr::bind_rows(list))
+}
+```
+
+```{r, Cross Entropy Dataframe}
+Cross.Entropy.Df <- data.table::rbindlist(Rivulus_Tess_Results, fill = TRUE) %>%
+  dplyr::select(K, crossentropy) %>%
+  dplyr::group_by(K) %>%
+  dplyr::summarise(Mean = mean(crossentropy),
+                   StandardDev = sd(crossentropy),
+                   Min = min(crossentropy)) %>%
+  dplyr::mutate(Method = "TESS3") %>%
+  dplyr::bind_rows(., (sNMF.K.DF.Fun(Rivulus_snmf, 5, 30) %>%
+                         dplyr::mutate(Method = "sNMF"))) %>%
+  dplyr::mutate(Method = factor(Method, levels = c("DAPC", "STRUCTURE", "InStruct", "TESS3", "sNMF")))
+```
+
+#### Structure & InStruct
+
+```{r, Structure & InStruct Dataframe}
+Structure_Instruct_df <- readr::read_tsv(file = paste(getwd(), "Results/Structure_Like/InStruct/Instruct_Results.txt", sep = "/")) %>%
+  dplyr::mutate(Software = "InStruct") %>%
+  dplyr::bind_rows(., (readr::read_tsv(file = paste(getwd(), "Results/Structure_Like/Structure/Structure_L.txt", sep = "/")) %>%
+                         dplyr::group_by(K) %>%
+                         dplyr::mutate(Software = "STRUCTURE",
+                                       Run = row_number()) %>%
+                         dplyr::select(-File_name, -Est_Ln_prob_data))) %>%
+  dplyr::mutate(Mean_LnP = (Mean_Ln_likelihood - (Variance_Ln_likelihood/2))) %>%
+  dplyr::group_by(K, Software) %>%
+  dplyr::summarise(Stdev_LnP = sd(Mean_LnP),
+                   Mean_Ln_likelihood = mean(Mean_Ln_likelihood),
+                   Mean_LnP = mean(Mean_LnP),
+                   Stdev_Ln_likelihood = mean(sqrt(Variance_Ln_likelihood))) %>%
+  dplyr::group_by(Software) %>%
+  dplyr::mutate(LnRTC = Mean_LnP - lag(Mean_LnP),
+                LnRTC2 = abs(lead(LnRTC) - LnRTC),
+                DeltaK = LnRTC2/Stdev_LnP) %>%
+  dplyr::mutate(Software = factor(Software, levels = c("DAPC", "STRUCTURE", "InStruct", "TESS3", "sNMF")))
+
+```
+
+#### Graphs
+
+##### DAPC
+
+```{r, DAPC}
+DAPC.Graph <- ggplot2::ggplot(data = (DAPC.DF %>%
+                                        dplyr::mutate(BIC = BIC/100)),
+              aes(x = K, y = BIC), linetype = Method, shape = Method) +
+  geom_point() +
+  scale_linetype(drop = FALSE) +
+  scale_shape(drop = FALSE) +
+  geom_line() +
+  labs(x = "Number of Clusters (K)", y = bquote('BIC ('~10^2~')')) + 
+  theme_classic() +
+  theme(text=element_text(family="serif", size = 12))
+
+```
+
+##### Cross Entropy
+
+```{r, Cross Entropy}
+
+Cross.Entropy.Graph <- ggplot2::ggplot(data = (Cross.Entropy.Df %>%
+                                                 dplyr::mutate(Min = Min*100)),
+              aes(x = K, y = Min, shape = Method, linetype = Method)) +
+  geom_point() +
+  geom_line() +
+  scale_linetype(drop=FALSE) +
+  scale_shape(drop = FALSE) +
+  labs(x = "Number of Clusters (K)", y = bquote('Minimum Cross-Entropy ( '~10^-2~')')) + 
+  theme_classic() +
+  theme(text=element_text(family="serif", size = 12))
+```
+
+##### Structure & InStruct
+
+```{r, Logliklihood Graph}
+
+STR.InSt.LN.Graph <- ggplot2::ggplot(data = (Structure_Instruct_df %>%
+                                               dplyr::mutate(Mean_Ln_likelihood = Mean_Ln_likelihood/10000)),
+              aes(x = K, y = Mean_Ln_likelihood, linetype = Software, shape = Software)) +
+  geom_point() +
+  geom_line() +
+  scale_linetype(drop=FALSE) +
+  scale_shape(drop = FALSE) +
+  labs(x = "Number of Clusters (K)", y = bquote('Mean Loglikelihood ('~10^4~')')) + 
+  theme_classic() +
+  theme(text=element_text(family="serif", size = 12))
+
+```
+
+```{r, LN of Data Graph}
+
+### make a plot insert with STRUCTURE or break
+STR.InSt.LnK.Plot <- ggplot2::ggplot(data = (Structure_Instruct_df %>%
+                                               dplyr::mutate(Mean_LnP = Mean_LnP/10000)),
+                                      aes(x = K, y = Mean_LnP, linetype = Software, shape = Software)) +
+  geom_point() +
+  geom_line() +
+  scale_linetype(drop=FALSE) +
+  scale_shape(drop = FALSE) +
+  facet_wrap(~Software, scales = "free_y", ncol = 1) +
+  labs(x = "Number of Clusters (K)", y = bquote('Mean Loglikelihood of the Data ( '~10^4~')' )) + 
+  theme_classic() +
+  geom_segment(data = data.frame(STR.K8.X = 8, STR.K8.Y = -10.2,
+                                  STR.K8.X.End = 8, STR.K8.Y.End = -8.10768, 
+                              Software = factor("STRUCTURE", 
+                              levels = c("DAPC", "STRUCTURE", "InStruct", "TESS3", "sNMF"))),
+                  aes(x = STR.K8.X, y = STR.K8.Y, xend = STR.K8.X.End, yend = STR.K8.Y.End), 
+               arrow = arrow(length = unit(0.25, "cm")),
+               show.legend = FALSE) +
+  geom_text(data = data.frame(K = 8, Mean_LnP = -10.5, 
+                              Software = factor("STRUCTURE", 
+                              levels = c("DAPC", "STRUCTURE", "InStruct", "TESS3", "sNMF"))), label = expression(Delta*K*" = 12.6"), parse = TRUE) +
+  geom_segment(data = data.frame(STR.K8.X = 19, STR.K8.Y = -10.2,
+                                  STR.K8.X.End = 19, STR.K8.Y.End = -7, 
+                              Software = factor("STRUCTURE", 
+                              levels = c("DAPC", "STRUCTURE", "InStruct", "TESS3", "sNMF"))),
+                  aes(x = STR.K8.X, y = STR.K8.Y, xend = STR.K8.X.End, yend = STR.K8.Y.End), 
+               arrow = arrow(length = unit(0.25, "cm")),
+               show.legend = FALSE) +
+  geom_text(data = data.frame(K = 19, Mean_LnP = -10.5, 
+                              Software = factor("STRUCTURE", 
+                              levels = c("DAPC", "STRUCTURE", "InStruct", "TESS3", "sNMF"))), label = expression(Delta*K*" = 7.1"), parse = TRUE) +
+  geom_segment(data = data.frame(STR.K8.X = 20, STR.K8.Y = -160,
+                                  STR.K8.X.End = 20, STR.K8.Y.End = -230, 
+                              Software = factor("InStruct", 
+                              levels = c("DAPC", "STRUCTURE", "InStruct", "TESS3", "sNMF"))),
+                  aes(x = STR.K8.X, y = STR.K8.Y, xend = STR.K8.X.End, yend = STR.K8.Y.End), 
+               arrow = arrow(length = unit(0.25, "cm")),
+               show.legend = FALSE) +
+  geom_text(data = data.frame(K = 20, Mean_LnP = -150, 
+                              Software = factor("InStruct", 
+                              levels = c("DAPC", "STRUCTURE", "InStruct", "TESS3", "sNMF"))), label = expression(Delta*K*" = 7"), parse = TRUE) +
+  geom_segment(data = data.frame(STR.K8.X = 8, STR.K8.Y = -220,
+                                  STR.K8.X.End = 8, STR.K8.Y.End = -180, 
+                              Software = factor("InStruct", 
+                              levels = c("DAPC", "STRUCTURE", "InStruct", "TESS3", "sNMF"))),
+                  aes(x = STR.K8.X, y = STR.K8.Y, xend = STR.K8.X.End, yend = STR.K8.Y.End), 
+               arrow = arrow(length = unit(0.25, "cm")),
+               show.legend = FALSE) +
+  geom_text(data = data.frame(K = 8, Mean_LnP = -230, 
+                              Software = factor("InStruct", 
+                              levels = c("DAPC", "STRUCTURE", "InStruct", "TESS3", "sNMF"))), label = expression(Delta*K*" = 6.4"), parse = TRUE) + 
+  theme(text=element_text(family="serif", size = 12),
+        legend.position = "bottom",
+        legend.margin = margin(0,0,0,0),
+        legend.justification = "left") 
+```
+
+```{DIC InStruct}
+
+Instruct.DIC.df <- readr::read_tsv(file = paste(getwd(), "Results/Structure_Like/InStruct/Instruct_DIC.txt", sep = "/")) %>%
+  dplyr::group_by(K) %>%
+  dplyr::summarise(DIC = mean(DIC)) %>%
+  dplyr::mutate(Software = factor("InStruct", levels = c("DAPC", "STRUCTURE", "InStruct", "TESS3", "sNMF")))
+
+
+
+Instruct.DIC.Graph <- ggplot2::ggplot(data = (Instruct.DIC.df %>%
+                                                dplyr::mutate(DIC = DIC/10000)),
+             aes(x = K, y = DIC, linetype = Software, shape = Software)) +
+  geom_point() +
+  geom_line() +
+  scale_linetype(drop=FALSE) +
+  scale_shape(drop = FALSE) +
+  labs(x = "Number of Clusters (K)", y = bquote('DIC ('~10^4~')')) + 
+  theme_classic() +
+  theme(text=element_text(family="serif", size = 12))
+                                  
+
+# Evanno method says 8. Second in Evanno is 19. Highest is 18 and 14 is when it starts to level out.
+
+### maybe run an amova
+```
+
+##### Combing Graphs
+
+```{r, Combining Comparisin Graphs}
+Combined.Clustering.Graph <- cowplot::plot_grid((cowplot::plot_grid(DAPC.Graph +
+                                                                       theme(legend.position = "none"),
+                                                                     STR.InSt.LN.Graph + 
+                                                                       theme(legend.position="none"),
+                                                                     Cross.Entropy.Graph +
+                                                                       theme(legend.position="none"),
+                                                                     Instruct.DIC.Graph +
+                                                                       theme(legend.position="none"),
+                                                                     labels = c("A", "B", "D", "E"))),
+                                                 STR.InSt.LnK.Plot,
+                                                labels = c("", "C"),
+                                                ncol = 2,
+                                                rel_widths = c(1, 0.65),
+                                                label_fontfamily = "serif")
+
+# 15.25 and 7
+                                                
+
+```
+
+
+## DAPC 5
+
+```{r, DAPC 5 plot}
+
+# chose 5 clusters
+grp <- adegenet::find.clusters(Population.Genetic.Data.genid, max.n.clust = 60, pca.select = "percVar", perc.pca = 100, stat = c("BIC"))
+
+# make the object for DAPC 5
+DAPC.5 <- adegenet::dapc(Population.Genetic.Data.genid, grp$grp, pca.select = "percVar", perc.pca = 100)
+
+# Axis 1 = 73%
+# Axis 2 = 22%
+# Axis 3 = 3.85%
+# Axis 4 = 0.96%
+
+# data frame for plotting
+DAPC.5.df <- as.data.frame(DAPC.5$ind.coord) %>%
+  # rename
+  dplyr::rename("Axis1" = 1,
+                "Axis2" = 2,
+                "Axis3" = 3,
+                "Axis4" = 4) %>%
+  # make new column
+  tibble::rownames_to_column(., var = "ID") %>%
+  # join
+  dplyr::left_join(., (Population.Genetic.Data %>%
+                         dplyr::select(ID, Population_ID))) %>%
+  # rename
+  dplyr::rename("Population" = "Population_ID")
+  
+# get centroids
+DAPC.5.Centroids <- aggregate(cbind(Axis1, Axis2, Axis3, Axis4) ~ Population, 
+                                 data = DAPC.5.df, FUN = mean) %>%
+  # rename
+  dplyr::rename("Axis1.Cent" = 2,
+                "Axis2.Cent" = 3,
+                "Axis3.Cent" = 4,
+                "Axis4.Cent" = 5)
+
+# add to data frame
+DAPC.5.df <- dplyr::left_join(DAPC.5.df, DAPC.5.Centroids)
+  
+DAPC.Plot.1.2 <- ggplot2::ggplot(data = DAPC.5.df, aes(x = Axis1, y = Axis2)) +
+  # lines
+  geom_hline(yintercept = 0) +
+  # lines
+  geom_vline(xintercept = 0) +
+  # spider segments
+  geom_segment(aes(xend = Axis1.Cent, yend = Axis2.Cent, colour = Population),
+               show.legend = FALSE) +
+  # points
+  geom_point(aes(fill = Population), shape = 21, size = 3, show.legend = TRUE) +
+  # change axis labels
+  labs(x = "Axis 1 (73%)", y = "Axis 2 (22%)") +
+  # add theme
+  theme_classic() +
+  # change fonts
+  theme(text=element_text(family= "serif", size = 12))
+
+
+DAPC.Plot.2.3 <- ggplot2::ggplot(data = DAPC.5.df, aes(x = Axis2, y = Axis3)) +
+  # lines
+  geom_hline(yintercept = 0) +
+  # lines
+  geom_vline(xintercept = 0) +
+  # spider segments
+  geom_segment(aes(xend = Axis2.Cent, yend = Axis3.Cent, colour = Population),
+               show.legend = FALSE) +
+  # points
+  geom_point(aes(fill = Population), shape = 21, size = 3, show.legend = TRUE) +
+  # change axis labels
+  labs(x = "Axis 2 (22%)", y = "Axis 3 (3.85%)") +
+  # add theme
+  theme_classic() +
+  # change fonts
+  theme(text=element_text(family= "serif", size = 12))
+
+  
+DAPC.Plot.3.4 <- ggplot2::ggplot(data = DAPC.5.df, aes(x = Axis3, y = Axis4)) +
+  # lines
+  geom_hline(yintercept = 0) +
+  # lines
+  geom_vline(xintercept = 0) +
+  # spider segments
+  geom_segment(aes(xend = Axis3.Cent, yend = Axis4.Cent, colour = Population),
+               show.legend = FALSE) +
+  # points
+  geom_point(aes(fill = Population), shape = 21, size = 3, show.legend = TRUE) +
+  # change axis labels
+  labs(x = "Axis 3 (3.85%)", y = "Axis 4 (0.96%)") +
+  # labels
+  geom_label(data = DAPC.5.Centroids, aes(label = Population, fill = Population,
+                                          x = Axis3.Cent, y = Axis4.Cent), size = 4, show.legend = FALSE) +
+  # add theme
+  theme_classic() +
+  # change fonts
+  theme(text=element_text(family= "serif", size = 12))
+
+DAPC5.Plot <- cowplot::plot_grid(DAPC.Plot.1.2 + theme(legend.position = "none"),
+                                 DAPC.Plot.2.3 + theme(legend.position = "none"),
+                                 DAPC.Plot.3.4 + theme(legend.position = "none"),
+                                 cowplot::get_legend(DAPC.Plot.3.4 +
+                                                       guides(colour = guide_legend(ncol=3))),
+                                 labels = c("A", "B", "C", ""),
+                                 nrow = 2)
+```
+## Ancestory Charts
+
+### K = 8
+
+#### Formatting
+
+```{r, STRUCTURE K = 8 Ancestory DF}
+Riv.STR.K.8.Chain3 <- read.table(paste(getwd(), "/Results/Structure_Like/Structure/Riv_STR_Out8_Chain3_q", sep = ""), quote="\"", comment.char="") %>%
+  dplyr::rename(Individual = V1,
+                Pop1 = V3,
+                Pop3 = V4,
+                Pop5 = V5,
+                Pop2 = V6,
+                Pop8 = V7,
+                Pop6 = V8,
+                Pop4 = V9,
+                Pop7 = V10) %>%
+  dplyr::mutate(Population_ID =  dplyr::case_when(V2 == 1 ~ "TC",
+                                                  V2 == 2 ~ "TA",
+                                                  V2 == 3 ~ "LC",
+                                                  V2 == 4 ~ "NC",
+                                                  V2 == 5 ~ "UH",
+                                                  V2 == 6 ~ "TB",
+                                                  V2 == 7 ~ "CC",
+                                                  V2 == 8 ~ "LK",
+                                                  V2 == 9 ~ "EG",
+                                                  V2 == 10 ~ "UK",
+                                                  V2 == 11 ~ "NS",
+                                                  V2 == 12 ~ "IR",
+                                                  V2 == 13 ~ "SL",
+                                                  V2 == 14 ~ "FL",
+                                                  V2 == 15 ~ "LB",
+                                                  V2 == 16 ~ "EI",
+                                                  V2 == 17 ~ "SS"),
+                Clustering.Software = "STRUCTURE") %>%
+  dplyr::select(Population_ID, Individual, Clustering.Software, Pop1, Pop2, Pop3, Pop4, Pop5, Pop6, Pop7, Pop8) %>%
+  dplyr::left_join(., (Population.Genetic.Data %>%
+                         dplyr::select(Latitude, Longitude, ID, Population_ID, REGION)), by = c("Individual" = "ID", "Population_ID" = "Population_ID")) %>%
+  dplyr::mutate(Latitude = dplyr::if_else(Individual == "SSBC03", (Population.Genetic.Data %>%
+                                                                     dplyr::filter(Individual == "SSBC03"))$Latitude, Latitude),
+                Longitude = dplyr::if_else(Individual == "SSBC03", (Population.Genetic.Data %>%
+                                                                     dplyr::filter(Individual == "SSBC03"))$Longitude, Longitude)) %>%
+  tidyr::pivot_longer(., c(4:11), names_to = "Assignment", values_to = "Proportion") %>%
+  dplyr::group_by(Individual) %>%
+  dplyr::arrange(desc(Proportion)) %>%
+  dplyr::mutate(Population_ID = factor(Population_ID, levels = c("TB", "CC", "FL", "SL", "LB", "LK", "EG", "UK", "LC", "NC", "UH", "TA", "TC", "SS", "EI", "IR", "NS")), 
+                Assigned_Pop = Assignment[dplyr::row_number() == 1]) %>%
+  dplyr::group_by(Latitude, Longitude) %>%
+  dplyr::mutate(Location_Population_Assigned = names(which.max(table(Assigned_Pop)))) %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(Assigned_Pop, 
+                 Population_ID, 
+                 desc(Proportion),
+                 Assignment) %>%
+  dplyr::mutate(Individual = factor(Individual, levels = unique(.$Individual)),
+                Assignment = factor(Assignment))
+```
+
+```{r, InStruct K = 8 Ancestory DF}
+
+Rivulus_InStruct_K8 <- read.delim(paste(getwd(), "/Results/Structure_Like/InStruct/InStruct_Best_K8.txt", sep = ""), header=TRUE) %>%
+  dplyr::rename(Individual = Label,
+                Pop4 = Cluster.1,
+                Pop5 = Cluster.2,
+                Pop1 = Cluster.3,
+                Pop3 = Cluster.4,
+                Pop8 = Cluster.5,
+                Pop2 = Cluster.6,
+                Pop7 = Cluster.7,
+                Pop6 = Cluster.8) %>%
+  dplyr::mutate(Population_ID =  dplyr::case_when(Pop.. == "0 : " ~ "TC",
+                                                  Pop.. == "1 : " ~ "TA",
+                                                  Pop.. == "2 : " ~ "LC",
+                                                  Pop.. == "3 : " ~ "NC",
+                                                  Pop.. == "4 : " ~ "UH",
+                                                  Pop.. == "5 : " ~ "TB",
+                                                  Pop.. == "6 : " ~ "CC",
+                                                  Pop.. == "7 : " ~ "LK",
+                                                  Pop.. == "8 : " ~ "EG",
+                                                  Pop.. == "9 : " ~ "UK",
+                                                  Pop.. == "10 : " ~ "NS",
+                                                  Pop.. == "11 : " ~ "IR",
+                                                  Pop.. == "12 : " ~ "SL",
+                                                  Pop.. == "13 : " ~ "FL",
+                                                  Pop.. == "14 : " ~ "LB",
+                                                  Pop.. == "15 : " ~ "EI",
+                                                  Pop.. == "16 : " ~ "SS"),
+                Clustering.Software = "InStruct") %>%
+  dplyr::select(Population_ID, Individual, Clustering.Software, Pop1, Pop2, Pop3, Pop4, Pop5, Pop6, Pop7, Pop8) %>%
+  dplyr::left_join(., (Population.Genetic.Data %>%
+                         dplyr::select(Latitude, Longitude, ID, Population_ID, REGION)), by = c("Individual" = "ID", "Population_ID" = "Population_ID")) %>%
+  dplyr::mutate(Latitude = dplyr::if_else(Individual == "SSBC03", (Population.Genetic.Data %>%
+                                                                     dplyr::filter(Individual == "SSBC03"))$Latitude, Latitude),
+                Longitude = dplyr::if_else(Individual == "SSBC03", (Population.Genetic.Data %>%
+                                                                     dplyr::filter(Individual == "SSBC03"))$Longitude, Longitude)) %>%
+  tidyr::pivot_longer(., c(4:11), names_to = "Assignment", values_to = "Proportion") %>%
+  dplyr::group_by(Individual) %>%
+  dplyr::arrange(desc(Proportion)) %>%
+  dplyr::mutate(Population_ID = factor(Population_ID, levels = c("TB", "CC", "FL", "SL", "LB", "LK", "EG", "UK", "LC", "NC", "UH", "TA", "TC", "SS", "EI", "IR", "NS")), 
+                Assigned_Pop = Assignment[dplyr::row_number() == 1]) %>%
+  dplyr::group_by(Latitude, Longitude) %>%
+  dplyr::mutate(Location_Population_Assigned = names(which.max(table(Assigned_Pop)))) %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(Assigned_Pop, 
+                 Population_ID, 
+                 desc(Proportion),
+                 Assignment) %>%
+  dplyr::mutate(Individual = factor(Individual, levels = unique(Riv.STR.K.8.Chain3$Individual)),
+                Assignment = factor(Assignment))
+```
+
+```{r, LEA K = 8 Ancestory DF}
+
+Rivulus_LEA_Q8 <- LEA::Q(Rivulus_snmf, K = 8, which.min(LEA::cross.entropy(Rivulus_snmf, K = 8))) %>%
+  as.data.frame(.) %>%
+  cbind(., (Riv.STR.Data %>%
+              dplyr::select(c(1:4)) %>%
+              dplyr::distinct(.))) %>%
+  dplyr::rename(Individual = ID,
+                Pop8 = V1,
+                Pop2 = V2,
+                Pop3 = V3,
+                Pop1 = V4,
+                Pop4 = V5,
+                Pop7 = V6,
+                Pop6 = V7,
+                Pop5 = V8) %>%
+  dplyr::mutate(Clustering.Software = "sNMF") %>%
+  tidyr::pivot_longer(., c(1:8), names_to = "Assignment", values_to = "Proportion") %>%
+  dplyr::group_by(Individual) %>%
+  dplyr::arrange(desc(Proportion)) %>%
+  dplyr::mutate(Population_ID = factor(Population_ID, levels = c("TB", "CC", "FL", "SL", "LB", "LK", "EG", "UK", "LC", "NC", "UH", "TA", "TC", "SS", "EI", "IR", "NS")), 
+                Assigned_Pop = Assignment[dplyr::row_number() == 1]) %>%
+  dplyr::group_by(Latitude, Longitude) %>%
+  dplyr::mutate(Location_Population_Assigned = names(which.max(table(Assigned_Pop)))) %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(Assigned_Pop, 
+                 Population_ID, 
+                 desc(Proportion),
+                 Assignment) %>%
+  dplyr::mutate(Individual = factor(Individual, levels = unique(Riv.STR.K.8.Chain3$Individual)),
+                Assignment = factor(Assignment))
+```
+
+```{r, TESS3 K = 8 Ancestory DF}
+
+Rivulus_Tess_Q8 <- tess3r::qmatrix(Rivulus_Tess_Results, K = 8) %>% 
+  as.data.frame(.) %>%
+  cbind(., (Riv.STR.Data %>%
+              dplyr::select(c(1:4)) %>%
+              dplyr::distinct(.))) %>%
+  dplyr::rename(Individual = ID,
+                Pop2 = V1,
+                Pop4 = V2,
+                Pop1 = V3,
+                Pop5 = V4,
+                Pop7 = V5,
+                Pop8 = V6,
+                Pop3 = V7,
+                Pop6 = V8) %>% 
+  dplyr::mutate(Clustering.Software = "TESS3") %>%
+  tidyr::pivot_longer(., c(1:8), names_to = "Assignment", values_to = "Proportion") %>%
+  dplyr::group_by(Individual) %>%
+  dplyr::arrange(desc(Proportion)) %>%
+  dplyr::mutate(Population_ID = factor(Population_ID, levels = c("TB", "CC", "FL", "SL", "LB", "LK", "EG", "UK", "LC", "NC", "UH", "TA", "TC", "SS", "EI", "IR", "NS")), 
+                Assigned_Pop = Assignment[dplyr::row_number() == 1]) %>%
+  dplyr::group_by(Latitude, Longitude) %>%
+  dplyr::mutate(Location_Population_Assigned = names(which.max(table(Assigned_Pop)))) %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(Assigned_Pop, 
+                 Population_ID, 
+                 desc(Proportion),
+                 Assignment) %>%
+  dplyr::mutate(Individual = factor(Individual, levels = unique(Riv.STR.K.8.Chain3$Individual)),
+                Assignment = factor(Assignment))
+```
+
+```{r, Combine K =8 DF}
+Rivulus_K8_Combined_DF <- Riv.STR.K.8.Chain3 %>%
+  rbind(Rivulus_InStruct_K8) %>%
+  dplyr::select(-REGION) %>%
+  rbind(Rivulus_LEA_Q8) %>%
+  rbind(Rivulus_Tess_Q8) %>%
+  dplyr::mutate(Clustering.Software = factor(Clustering.Software, levels = c("STRUCTURE", "InStruct", "TESS3", "sNMF")),
+                Population_Name = dplyr::case_when(Population_ID == "NS" ~ "New Smyrna (NS)",
+                                                   Population_ID == "EG" ~ "Everglades (EG)",
+                                                   Population_ID == "LB" ~ "Lower Bogue (LB)",
+                                                   Population_ID == "EI" ~ "Exuma Island (EI)",
+                                                   Population_ID == "FL" ~ "Fort Lauderdale (FL)",
+                                                   Population_ID == "IR" ~ "Indian River (IR)",
+                                                   Population_ID == "UK" ~ "Upper Keys (UK)",
+                                                   Population_ID == "SL" ~ "Saint Lucie (SL)",
+                                                   Population_ID == "LC" ~ "Long Caye (LC)",
+                                                   Population_ID == "TC" ~ "Twin Cayes (TC)",
+                                                   Population_ID == "TA" ~ "Turneffe Atoll (TA)",
+                                                   Population_ID == "SS" ~ "San Salvador (SS)",
+                                                   Population_ID == "CC" ~ "Charlotte County (CC)",
+                                                   Population_ID == "LK" ~ "Lower Keys (LK)",
+                                                   Population_ID == "UH" ~ " Utila, Honduras (UH)",
+                                                   Population_ID == "NC" ~ "Northern Caye (NC)",
+                                                   Population_ID == "TB" ~ "Tampa Bay (TB)"),
+                Region = dplyr::case_when(Population_ID %in% c("EG", "LK", "UK") ~ "South Florida",
+                                               Population_ID %in% c("EI", "LB", "SS") ~ "Bahammas",
+                                               Population_ID %in% c("TA", "TC", "NC", "UH", "LC") ~ "Central America",
+                                          Population_ID %in% c("NS", "SL", "FL", "IR", "CC", "TB") ~ "Mainland Florida"))
+
+```
+
+```{r, Ancestory chart K = 8}
+K8_STR_Compared <- ggplot2::ggplot(Rivulus_K8_Combined_DF, aes(x =Individual, y = Proportion, fill = Assignment)) + 
+  geom_col(size = 0.2) +
+  facet_grid(Clustering.Software~Population_ID, scales = "free", space = "free") + 
+  theme_minimal() +
+  labs(x = "Individuals", title = "K=8", y = "Ancestry", fill = "Cluster") +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_x_discrete(expand = expand_scale(add = 1)) +
+  scale_fill_brewer(palette = "Paired") +
+  theme(strip.clip = "off",
+        panel.spacing.y=unit(1, "lines"),
+        panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5),
+        axis.text.x = element_blank(),
+        axis.text.y = element_text(family = "serif", color = "black", size = 8),
+        panel.grid = element_blank(),
+        text = element_text(family = "serif", color = "black", size = 12),
+        axis.title = element_text(family = "serif", color = "black", size = 12),
+        strip.text.x = element_text(family = "serif", size = 12, color = "black", face = "bold", margin = margin(0,3,0,3)),
+                                    strip.text.y = element_text(family = "serif", size = 12, color = "black", face = "bold"))
+
+# 15 by 10
+
+STR_K8_Bar <- ggplot2::ggplot((Rivulus_K8_Combined_DF %>%
+                  dplyr::filter(Clustering.Software == "STRUCTURE")),
+                aes(x =Individual, y = Proportion, fill = Assignment)) + 
+  geom_col(size = 0.2) +
+  facet_wrap(~Population_ID, scales = "free_x", nrow = 2, drop = TRUE) + 
+  theme_minimal() +
+  labs(x = "Individuals", y = "Ancestry Proportion", fill = "Cluster") +
+  scale_y_continuous(expand = c(0, 0), breaks= c(0,1)) +
+  scale_x_discrete(expand = expand_scale(add = 1)) +
+  scale_fill_brewer(palette = "Paired") +
+  theme(panel.background = element_rect(fill = "aliceblue"),
+        strip.background =element_rect(fill="aliceblue", colour = NA),
+        panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5),
+        plot.margin = margin(0,0,0,0),
+        panel.spacing.x = unit(0, "lines"),
+        axis.text.x = element_blank(),
+        axis.text.y = element_text(family = "serif", color = "black", size = 8,
+                                   margin = margin(r = -2.5)),
+        panel.grid = element_blank(),
+        text = element_text(family = "serif", color = "black", size = 8),
+        strip.text.x = element_text(family = "serif", size = 8, color = "black", face = "bold",
+                                    margin = margin(0,0,0,0)),
+        axis.title.y = element_text(color="black", size= 9.5, margin = margin(0,-0.5,0,0)),
+        axis.title.x = element_text(color="black", size= 9.5, margin = margin(0,0,0,-0.3)),
+        plot.background = element_rect(fill = "aliceblue",
+                                        color = "transparent",
+                                       linewidth = 0.5),
+        legend.position = c(1, 0),
+        legend.justification = c(1, 0),
+        legend.key.height= unit(2.5, 'mm'),
+        legend.key.width= unit(0.7, 'mm'),
+        legend.key=element_rect(colour="black"),
+        legend.text=element_text(size= 5.5),
+        legend.margin=margin(0,0,0,0))
+```
+
+### K = 20
+
+#### Formatting
+
+```{r, STRUCTURE K = 20 Ancestory DF}
+Riv.STR.K.20.Chain3 <- read.table(paste(getwd(), "/Results/Structure_Like/Structure/Riv_STR_Out20_Chain3_q", sep = ""), quote="\"", comment.char="") %>%
+  dplyr::rename(Individual = V1,
+                Pop18 = V3,
+                Pop4 = V4, 
+                Pop2 = V5, 
+                Pop12 = V6,
+                Pop20 = V7,
+                Pop17 = V8,
+                Pop19 = V9,
+                Pop13 = V10,
+                Pop15 = V11,
+                Pop7 = V12, 
+                Pop3 = V13, 
+                Pop10 = V14, 
+                Pop1 = V15, 
+                Pop16 = V16,
+                Pop6 = V17, 
+                Pop11 = V18,
+                Pop9 = V19,
+                Pop14 = V20,
+                Pop5 = V21,
+                Pop8 = V22) %>%
+  dplyr::mutate(Population_ID =  dplyr::case_when(V2 == 1 ~ "TC",
+                                                  V2 == 2 ~ "TA",
+                                                  V2 == 3 ~ "LC",
+                                                  V2 == 4 ~ "NC",
+                                                  V2 == 5 ~ "UH",
+                                                  V2 == 6 ~ "TB",
+                                                  V2 == 7 ~ "CC",
+                                                  V2 == 8 ~ "LK",
+                                                  V2 == 9 ~ "EG",
+                                                  V2 == 10 ~ "UK",
+                                                  V2 == 11 ~ "NS",
+                                                  V2 == 12 ~ "IR",
+                                                  V2 == 13 ~ "SL",
+                                                  V2 == 14 ~ "FL",
+                                                  V2 == 15 ~ "LB",
+                                                  V2 == 16 ~ "EI",
+                                                  V2 == 17 ~ "SS"),
+                Clustering.Software = "STRUCTURE") %>%
+  dplyr::select(-V2) %>%
+  dplyr::left_join(., (Population.Genetic.Data %>%
+                         dplyr::select(Latitude, Longitude, ID, Population_ID, REGION)), by = c("Individual" = "ID", "Population_ID" = "Population_ID")) %>%
+  dplyr::mutate(Latitude = dplyr::if_else(Individual == "SSBC03", (Population.Genetic.Data %>%
+                                                                     dplyr::filter(Individual == "SSBC03"))$Latitude, Latitude),
+                Longitude = dplyr::if_else(Individual == "SSBC03", (Population.Genetic.Data %>%
+                                                                     dplyr::filter(Individual == "SSBC03"))$Longitude, Longitude)) %>%
+  tidyr::pivot_longer(., c(2:21), names_to = "Assignment", values_to = "Proportion") %>%
+  dplyr::group_by(Individual) %>%
+  dplyr::arrange(desc(Proportion)) %>%
+  dplyr::mutate(Population_ID = factor(Population_ID, levels = c("TB", "CC", "EG", "FL", "LK", "UK", "LB", "LC", "NC", "UH", "TA", "TC", "SS", "SL", "EI", "IR", "NS")), 
+                Assigned_Pop = factor(Assignment[dplyr::row_number() == 1], levels = c("Pop1", "Pop2", "Pop3","Pop4", "Pop5", "Pop6", "Pop7", "Pop8", "Pop9","Pop10", "Pop11", "Pop12", "Pop13", "Pop14", "Pop15","Pop16", "Pop17", "Pop18", "Pop19", "Pop20")),
+                Assignment = factor(Assignment, levels = c("Pop1", "Pop2", "Pop3","Pop4", "Pop5", "Pop6", "Pop7", "Pop8", "Pop9","Pop10", "Pop11", "Pop12", "Pop13", "Pop14", "Pop15","Pop16", "Pop17", "Pop18", "Pop19", "Pop20"))) %>%
+  dplyr::group_by(Latitude, Longitude) %>%
+  dplyr::mutate(Location_Population_Assigned = names(which.max(table(Assigned_Pop)))) %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(Assigned_Pop, 
+                 Population_ID,
+                 Assignment,
+                 desc(Proportion)) %>%
+  dplyr::mutate(Individual = factor(Individual, levels = unique(.$Individual)))
+```
+
+```{r, InStruct K = 20 Ancestory DF}
+
+Rivulus_InStruct_K20 <- read.delim(paste(getwd(), "/Results/Structure_Like/InStruct/InStruct_Best_K20.txt", sep = ""), header=TRUE) %>%
+  dplyr::rename(Individual = Label,
+                Pop3 = Cluster.1, 
+                Pop12 = Cluster.2, 
+                Pop11 = Cluster.3,
+                Pop7 = Cluster.4,
+                Pop4 = Cluster.5,
+                Pop19 = Cluster.6,
+                Pop20 = Cluster.7,
+                Pop5 = Cluster.8,
+                Pop9 = Cluster.9,
+                Pop15 = Cluster.10,
+                Pop1 = Cluster.11, 
+                Pop17 = Cluster.12,
+                Pop14 = Cluster.13,
+                Pop18 = Cluster.14,
+                Pop10 = Cluster.15,
+                Pop16 = Cluster.16,
+                Pop8 = Cluster.17,
+                Pop6 = Cluster.18,
+                Pop2 = Cluster.19, 
+                Pop13 = Cluster.20) %>%
+  dplyr::mutate(Population_ID =  dplyr::case_when(Pop.. == "0 : " ~ "TC",
+                                                  Pop.. == "1 : " ~ "TA",
+                                                  Pop.. == "2 : " ~ "LC",
+                                                  Pop.. == "3 : " ~ "NC",
+                                                  Pop.. == "4 : " ~ "UH",
+                                                  Pop.. == "5 : " ~ "TB",
+                                                  Pop.. == "6 : " ~ "CC",
+                                                  Pop.. == "7 : " ~ "LK",
+                                                  Pop.. == "8 : " ~ "EG",
+                                                  Pop.. == "9 : " ~ "UK",
+                                                  Pop.. == "10 : " ~ "NS",
+                                                  Pop.. == "11 : " ~ "IR",
+                                                  Pop.. == "12 : " ~ "SL",
+                                                  Pop.. == "13 : " ~ "FL",
+                                                  Pop.. == "14 : " ~ "LB",
+                                                  Pop.. == "15 : " ~ "EI",
+                                                  Pop.. == "16 : " ~ "SS"),
+                Clustering.Software = "InStruct") %>%
+  dplyr::select(Individual, c(5:ncol(.))) %>%
+  dplyr::left_join(., (Population.Genetic.Data %>%
+                         dplyr::select(Latitude, Longitude, ID, Population_ID, REGION)), by = c("Individual" = "ID", "Population_ID" = "Population_ID")) %>%
+  dplyr::mutate(Latitude = dplyr::if_else(Individual == "SSBC03", (Population.Genetic.Data %>%
+                                                                     dplyr::filter(Individual == "SSBC03"))$Latitude, Latitude),
+                Longitude = dplyr::if_else(Individual == "SSBC03", (Population.Genetic.Data %>%
+                                                                     dplyr::filter(Individual == "SSBC03"))$Longitude, Longitude)) %>%
+  tidyr::pivot_longer(., c(2:21), names_to = "Assignment", values_to = "Proportion") %>%
+  dplyr::group_by(Individual) %>%
+  dplyr::arrange(desc(Proportion)) %>%
+  dplyr::mutate(Population_ID = factor(Population_ID, levels = c("TB", "CC", "EG", "FL", "LK", "UK", "LB", "LC", "NC", "UH", "TA", "TC", "SS", "SL", "EI", "IR", "NS")), 
+                Assigned_Pop = factor(Assignment[dplyr::row_number() == 1], levels = c("Pop1", "Pop2", "Pop3","Pop4", "Pop5", "Pop6", "Pop7", "Pop8", "Pop9","Pop10", "Pop11", "Pop12", "Pop13", "Pop14", "Pop15","Pop16", "Pop17", "Pop18", "Pop19", "Pop20")),
+                Assignment = factor(Assignment, levels = c("Pop1", "Pop2", "Pop3","Pop4", "Pop5", "Pop6", "Pop7", "Pop8", "Pop9","Pop10", "Pop11", "Pop12", "Pop13", "Pop14", "Pop15","Pop16", "Pop17", "Pop18", "Pop19", "Pop20"))) %>%
+  dplyr::group_by(Latitude, Longitude) %>%
+  dplyr::mutate(Location_Population_Assigned = names(which.max(table(Assigned_Pop)))) %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(Assigned_Pop, 
+                 Population_ID,
+                 Assignment,
+                 desc(Proportion)) %>%
+  dplyr::mutate(Individual = factor(Individual, levels = unique(Riv.STR.K.20.Chain3$Individual)))
+```
+
+```{r, LEA K = 20 Ancestory DF}
+
+Rivulus_LEA_Q20 <- LEA::Q(Rivulus_snmf, K = 20, which.min(LEA::cross.entropy(Rivulus_snmf, K = 20))) %>%
+  as.data.frame(.) %>%
+  cbind(., (Riv.STR.Data %>%
+              dplyr::select(c(1:4)) %>%
+              dplyr::distinct(.))) %>%
+  dplyr::rename(Individual = ID,
+                Pop7 = V1,
+                Pop16 = V2,
+                Pop4 = V3,
+                Pop3 = V4,
+                Pop8 = V5,
+                Pop5 = V6,
+                Pop1 = V7,
+                Pop20 = V8,
+                Pop11 = V9,
+                Pop12 = V10,
+                Pop6 = V11,
+                Pop14 = V12,
+                Pop10 = V13,
+                Pop9 = V14,
+                Pop17 = V15,
+                Pop13 = V16,
+                Pop15 = V17,
+                Pop18 = V18,
+                Pop19 = V19,
+                Pop2 = V20) %>%
+  dplyr::mutate(Clustering.Software = "sNMF") %>%
+  tidyr::pivot_longer(., c(1:20), names_to = "Assignment", values_to = "Proportion") %>%
+  dplyr::group_by(Individual) %>%
+  dplyr::arrange(desc(Proportion)) %>%
+  dplyr::mutate(Population_ID = factor(Population_ID, levels = c("TB", "CC", "EG", "FL", "LK", "UK", "LB", "LC", "NC", "UH", "TA", "TC", "SS", "SL", "EI", "IR", "NS")), 
+                Assigned_Pop = factor(Assignment[dplyr::row_number() == 1], levels = c("Pop1", "Pop2", "Pop3","Pop4", "Pop5", "Pop6", "Pop7", "Pop8", "Pop9","Pop10", "Pop11", "Pop12", "Pop13", "Pop14", "Pop15","Pop16", "Pop17", "Pop18", "Pop19", "Pop20")),
+                Assignment = factor(Assignment, levels = c("Pop1", "Pop2", "Pop3","Pop4", "Pop5", "Pop6", "Pop7", "Pop8", "Pop9","Pop10", "Pop11", "Pop12", "Pop13", "Pop14", "Pop15","Pop16", "Pop17", "Pop18", "Pop19", "Pop20"))) %>%
+  dplyr::group_by(Latitude, Longitude) %>%
+  dplyr::mutate(Location_Population_Assigned = names(which.max(table(Assigned_Pop)))) %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(Assigned_Pop, 
+                 Population_ID, 
+                 Assignment,
+                 desc(Proportion)) %>%
+  dplyr::mutate(Individual = factor(Individual, levels = unique(Riv.STR.K.20.Chain3$Individual)))
+```
+
+```{r, TESS3 K = 20 Ancestory DF}
+
+Rivulus_Tess_Q20 <- tess3r::qmatrix(Rivulus_Tess_Results, K = 20) %>% 
+  as.data.frame(.) %>%
+  cbind(., (Riv.STR.Data %>%
+              dplyr::select(c(1:4)) %>%
+              dplyr::distinct(.))) %>%
+  dplyr::rename(Individual = ID,
+                Pop4 = V1,
+                Pop19 = V2,
+                Pop3 = V3,
+                Pop1 = V4,
+                Pop5 = V5,
+                Pop6 = V6,
+                Pop7 = V7,
+                Pop8 = V8,
+                Pop9 = V9,
+                Pop10 = V10,
+                Pop11 = V11,
+                Pop12 = V12,
+                Pop13 = V13,
+                Pop14 = V14,
+                Pop15 = V15,
+                Pop16 = V16,
+                Pop17 = V17,
+                Pop18 = V18,
+                Pop2 = V19,
+                Pop20 = V20) %>% 
+  dplyr::mutate(Clustering.Software = "TESS3") %>%
+  tidyr::pivot_longer(., c(1:20), names_to = "Assignment", values_to = "Proportion") %>%
+  dplyr::group_by(Individual) %>%
+  dplyr::arrange(desc(Proportion)) %>%
+  dplyr::mutate(Population_ID = factor(Population_ID, levels = c("TB", "CC", "EG", "FL", "LK", "UK", "LB", "LC", "NC", "UH", "TA", "TC", "SS", "SL", "EI", "IR", "NS")), 
+                Assigned_Pop = factor(Assignment[dplyr::row_number() == 1], levels = c("Pop1", "Pop2", "Pop3","Pop4", "Pop5", "Pop6", "Pop7", "Pop8", "Pop9","Pop10", "Pop11", "Pop12", "Pop13", "Pop14", "Pop15","Pop16", "Pop17", "Pop18", "Pop19", "Pop20")),
+                Assignment = factor(Assignment, levels = c("Pop1", "Pop2", "Pop3","Pop4", "Pop5", "Pop6", "Pop7", "Pop8", "Pop9","Pop10", "Pop11", "Pop12", "Pop13", "Pop14", "Pop15","Pop16", "Pop17", "Pop18", "Pop19", "Pop20"))) %>%
+  dplyr::group_by(Latitude, Longitude) %>%
+  dplyr::mutate(Location_Population_Assigned = names(which.max(table(Assigned_Pop)))) %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(Assigned_Pop, 
+                 Population_ID, 
+                 Assignment,
+                 desc(Proportion)) %>%
+  dplyr::mutate(Individual = factor(Individual, levels = unique(Riv.STR.K.20.Chain3$Individual)))
+```
+
+```{r, Combine K =20 DF}
+Rivulus_K20_Combined_DF <- Riv.STR.K.20.Chain3 %>%
+  rbind(Rivulus_InStruct_K20) %>%
+  dplyr::select(-REGION) %>%
+  rbind(Rivulus_LEA_Q20) %>%
+  rbind(Rivulus_Tess_Q20) %>%
+  dplyr::mutate(Clustering.Software = factor(Clustering.Software, levels = c("STRUCTURE", "InStruct", "TESS3", "sNMF")))
+
+```
+
+```{r, Ancestory chart K = 20}
+####make bar chart graph that facets by method for K=20 just for comparision.
+
+K20_STR_Compared <- ggplot2::ggplot(Rivulus_K20_Combined_DF, aes(x =Individual, y = Proportion, fill = Assignment)) + 
+  geom_col(size = 0.2) +
+  facet_grid(Clustering.Software~Population_ID, scales = "free", space = "free") + 
+  theme_minimal() +
+  labs(x = "Individuals", title = "K=20", y = "Ancestry", fill = "Cluster") +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_x_discrete(expand = expand_scale(add = 1)) +
+  theme(strip.clip = "off",
+        panel.spacing.y=unit(1, "lines"),
+        panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5),
+        axis.text.x = element_blank(),
+        axis.text.y = element_text(family = "serif", color = "black", size = 8),
+        panel.grid = element_blank(),
+        text = element_text(family = "serif", color = "black", size = 12),
+        axis.title = element_text(family = "serif", color = "black", size = 12),
+        strip.text.x = element_text(family = "serif", size = 12, color = "black", face = "bold", margin = margin(0,3,0,3)),
+                                    strip.text.y = element_text(family = "serif", size = 12, color = "black", face = "bold"))
+
+
+```
+## Map
+```{r, map}
+
+# the base world data for maps
+world <- rnaturalearth::ne_countries(scale = "large", returnclass = "sf")
+
+
+# get data frame
+Ancestry.Location.STR8.DF <- Rivulus_K8_Combined_DF %>%
+  # filter
+  dplyr::filter(Clustering.Software == "STRUCTURE") %>%
+  # select
+  dplyr::select(Latitude, Longitude, Population_ID, Population_Name, Location_Population_Assigned) %>%
+  # get unique
+  dplyr::distinct(.) %>%
+  # mutate to get region
+  dplyr::mutate(Region = dplyr::case_when(Population_ID %in% c("EG", "LK", "UK") ~ "South Florida",
+                                               Population_ID %in% c("EI", "LB", "SS") ~ "Bahammas",
+                                               Population_ID %in% c("TA", "TC", "NC", "UH", "LC") ~ "Central America",
+                                          Population_ID %in% c("NS", "SL", "FL", "IR") ~ "East Florida",
+                Population_ID %in% c("CC", "TB") ~ "West Florida"))
+
+# make map
+Ancestery_Sample_Map <- ggplot2::ggplot(data = world) +
+  # add world polygons
+  geom_sf(fill= "antiquewhite", 
+            color = "black") +
+  coord_sf(xlim = c(-90,-70.5),
+             ylim = c(15.6,31)) +
+  # all of the next sections are just adding the circles
+  ggforce::geom_mark_ellipse(data = Ancestry.Location.STR8.DF, aes(x = Longitude, y = Latitude,
+                                                                   group = Population_ID, label = Population_Name,
+                                                                   x0 = -80,
+                                                                   y0 = 31,
+                                                                   filter = Population_ID == "NS"),
+                             label.fontface = "plain",
+                             con.cap = 0, expand = 0.012, 
+                             label.fontsize = 8, label.family = "serif", con.border = "one", 
+                             label.buffer = unit(0.000001, "mm"), 
+                             label.margin = margin(0.5, 0.5, 0.5, 0.5, "mm")) +
+  ggforce::geom_mark_ellipse(data = Ancestry.Location.STR8.DF, aes(x = Longitude, y = Latitude,
+                                                                   group = Population_ID, label = Population_Name,
+                                                                   x0 = -75.5,
+                                                                   y0 = 29.5,
+                                                                   filter = Population_ID == "IR"), 
+                             label.fontface = "plain",
+                             con.cap = 0, expand = 0.012, 
+                             label.fontsize = 8, label.family = "serif", con.border = "one", 
+                             label.buffer = unit(0.000001, "mm"), 
+                             label.margin = margin(0.5, 0.5, 0.5, 0.5, "mm")) +
+  ggforce::geom_mark_ellipse(data = Ancestry.Location.STR8.DF, aes(x = Longitude, y = Latitude,
+                                                                   group = Population_ID, label = Population_Name,
+                                                                   x0 = -76,
+                                                                   y0 = 28.5,
+                                                                   filter = Population_ID == "SL"),
+                             label.fontface = "plain",
+                             con.cap = 0, expand = 0.012, 
+                             label.fontsize = 8, label.family = "serif", con.border = "one", 
+                             label.buffer = unit(0.000001, "mm"), 
+                             label.margin = margin(0.5, 0.5, 0.5, 0.5, "mm")) +
+  ggforce::geom_mark_ellipse(data = Ancestry.Location.STR8.DF, aes(x = Longitude, y = Latitude,
+                                                                   group = Population_ID, label = Population_Name,
+                                                                   x0 = -76,
+                                                                   y0 = 28,
+                                                                   filter = Population_ID == "FL"), 
+                             label.fontface = "plain",
+                             con.cap = 0, expand = 0.012, 
+                             label.fontsize = 8, label.family = "serif", con.border = "one", 
+                             label.buffer = unit(0.000001, "mm"), 
+                             label.margin = margin(0.5, 0.5, 0.5, 0.5, "mm")) +
+  ggforce::geom_mark_ellipse(data = Ancestry.Location.STR8.DF, aes(x = Longitude, y = Latitude,
+                                                                   group = Population_ID, label = Population_Name,
+                                                                   x0 = -73,
+                                                                   y0 = 27,
+                                                                   filter = Population_ID == "LB"),
+                             label.fontface = "plain",
+                             con.cap = 0, expand = 0.012, 
+                             label.fontsize = 8, label.family = "serif", con.border = "one", 
+                             label.buffer = unit(0.000001, "mm"), 
+                             label.margin = margin(0.5, 0.5, 0.5, 0.5, "mm")) +
+  ggforce::geom_mark_ellipse(data = Ancestry.Location.STR8.DF, aes(x = Longitude, y = Latitude,
+                                                                   group = Population_ID, label = Population_Name,
+                                                                   x0 = -78.5,
+                                                                   y0 = 25,
+                                                                   filter = Population_ID == "EI"),
+                             label.fontface = "plain",
+                             con.cap = 0, expand = 0.012, 
+                             label.fontsize = 8, label.family = "serif", con.border = "one", 
+                             label.buffer = unit(0.000001, "mm"), 
+                             label.margin = margin(0.5, 0.5, 0.5, 0.5, "mm")) +
+  ggforce::geom_mark_ellipse(data = Ancestry.Location.STR8.DF, aes(x = Longitude, y = Latitude,
+                                                                   group = Population_ID, label = Population_Name,
+                                                                   x0 = -73,
+                                                                   y0 = 25,
+                                                                   filter = Population_ID == "SS"),
+                             label.fontface = "plain",
+                             con.cap = 0, expand = 0.012, 
+                             label.fontsize = 8, label.family = "serif", con.border = "one", 
+                             label.buffer = unit(0.000001, "mm"), 
+                             label.margin = margin(0.5, 0.5, 0.5, 0.5, "mm")) +
+  ggforce::geom_mark_ellipse(data = Ancestry.Location.STR8.DF, aes(x = Longitude, y = Latitude,
+                                                                   group = Population_ID, label = Population_Name,
+                                                                   x0 = -84.5,
+                                                                   y0 = 30.8,
+                                                                   filter = Population_ID == "TB"),
+                             label.fontface = "plain",
+                             con.cap = 0, expand = 0.012, 
+                             label.fontsize = 8, label.family = "serif", con.border = "one", 
+                             label.buffer = unit(0.000001, "mm"), 
+                             label.margin = margin(0.5, 0.5, 0.5, 0.5, "mm")) +
+  ggforce::geom_mark_ellipse(data = Ancestry.Location.STR8.DF, aes(x = Longitude, y = Latitude,
+                                                                   group = Population_ID, label = Population_Name,
+                                                                   x0 = -87,
+                                                                   y0 = 29.5,
+                                                                   filter = Population_ID == "CC"),
+                             label.fontface = "plain",
+                             con.cap = 0, expand = 0.012, 
+                             label.fontsize = 8, label.family = "serif", con.border = "one", 
+                             label.buffer = unit(0.000001, "mm"), 
+                             label.margin = margin(0.5, 0.5, 0.5, 0.5, "mm")) +
+  scale_colour_identity() +
+  # add location points
+  geom_point(data = Ancestry.Location.STR8.DF, aes(x = Longitude, y = Latitude, fill = Location_Population_Assigned),
+             shape=21)  +
+  scale_fill_brewer(palette = "Paired") +
+  # add scale bar and place in bottom right
+  ggspatial::annotation_scale(location = "bl",
+                   width_hint = 0.2,
+                   text_family = "serif",
+                   height = unit(1.5, "mm")) +
+  # place north arrow in top right
+  ggspatial::annotation_north_arrow(location = "tr", 
+                         which_north = "true", 
+        style = ggspatial::north_arrow_fancy_orienteering) +
+  #make dashed grid lines and fill the ocean with blue
+  theme(panel.grid.major = element_line(color = gray(.5), linetype = "dashed", size = 0.5), 
+        panel.background = element_rect(fill = "aliceblue"),
+        panel.border = element_rect(colour = "black", linewidth = 1, fill = NA),
+        text= element_text(family="serif", size = 8),
+        axis.title = element_text(size = 12),
+        legend.position="none") +
+  # Add red box around Florida keys
+  geom_rect(aes(xmin= -81.8,
+                xmax= -80.2, 
+                ymin= 24.4, 
+                ymax= 25.5), 
+            color="black", 
+            linewidth = 0.2, 
+            fill = NA) +
+  geom_segment(aes(x = -81.8, y = 25.5, xend = -84.15, yend = 28.3), 
+            color="black", 
+            linewidth = 0.2) +
+  geom_segment(aes(x = -81.8, y = 24.4, xend = -84.2, yend = 23.8), 
+            color="black", 
+            linewidth = 0.2) + 
+  # Add red box around Central America
+  geom_rect(aes(xmin= -89.7,
+                xmax= -86.7, 
+                ymin= 15.95, 
+                ymax= 18), 
+            color="black", 
+            linewidth = 0.2, 
+            fill = NA) +
+  geom_segment(aes(x = -89.7, y = 15.95, xend = -90.9, yend = 18.1), 
+            color="black", 
+            linewidth = 0.2) +
+  geom_segment(aes(x = -86.7, y = 15.95, xend = -83, yend = 18.1), 
+            color="black", 
+            linewidth = 0.2)
+
+
+Ancestery_Sample_Map_SF_Insert <- ggplot2::ggplot(data = world) +
+  # add world polygons
+  geom_sf(fill= "antiquewhite", 
+            color = "black") +
+  coord_sf(xlim = c(-81.57, 
+                    -80.45),
+           ylim = c(24.6,
+                    25.35)) +
+  # adding the circles just repeated code
+ ggforce::geom_mark_ellipse(data = Ancestry.Location.STR8.DF, aes(x = Longitude, y = Latitude,
+                                                                   group = Population_ID, label = Population_Name,
+                                                                   x0 = -81.3,
+                                                                   y0 = 24.8,
+                                                                   filter = Population_ID == "LK"), 
+                            label.fontface = "plain",
+                             con.cap = 0, expand = 0.015, 
+                             label.fontsize = 8, label.family = "serif", con.border = "one", 
+                             label.buffer = unit(0.000001, "mm"), 
+                             label.margin = margin(0.5, 0.5, 0.5, 0.5, "mm")) +
+  ggforce::geom_mark_ellipse(data = Ancestry.Location.STR8.DF, aes(x = Longitude, y = Latitude,
+                                                                   group = Population_ID, label = Population_Name,
+                                                                   x0 = -80.9,
+                                                                   y0 = 25,
+                                                                   filter = Population_ID == "UK"), 
+                             label.fontface = "plain",
+                             con.cap = 0, expand = 0.015, 
+                             label.fontsize = 8, label.family = "serif", con.border = "one", 
+                             label.buffer = unit(0.000001, "mm"), 
+                             label.margin = margin(0.5, 0.5, 0.5, 0.5, "mm")) +
+  ggforce::geom_mark_ellipse(data = Ancestry.Location.STR8.DF, aes(x = Longitude, y = Latitude,
+                                                                   group = Population_ID, label = Population_Name,
+                                                                   x0 = -81.2,
+                                                                   y0 = 25.3,
+                                                                   filter = Population_ID == "EG"), 
+                             label.fontface = "plain",
+                             con.cap = 0, expand = 0.015, 
+                             label.fontsize = 8, label.family = "serif", con.border = "one", 
+                             label.buffer = unit(0.000001, "mm"), 
+                             label.margin = margin(0.5, 0.5, 0.5, 0.5, "mm")) +
+  geom_point(data = Ancestry.Location.STR8.DF, aes(x = Longitude, y = Latitude, fill = Location_Population_Assigned),
+             shape=21, size = 2) + 
+  scale_fill_brewer(palette = "Paired") +
+  # add scale bar and place in bottom right
+  ggspatial::annotation_scale(location = "br",
+                   width_hint = 0.4,
+                   height = unit(0.15, "cm"),
+                   text_family = "serif") +
+  # place north arrow in top right
+  ggspatial::annotation_north_arrow(location = "tr", 
+                         which_north = "true", 
+        style = ggspatial::north_arrow_fancy_orienteering,
+        height = unit(.7, "cm"),
+        width = unit(.7, "cm"),) +
+  theme_void() +
+  #make dashed grid lines and fill the ocean with blue
+  theme(panel.background = element_rect(fill = "aliceblue"),
+        legend.position="none",
+        #make border
+        panel.border = element_rect(colour = "black",
+                                    fill=NA),
+        #plot margins
+        plot.margin = margin(-5,-10,0,-10),
+        #remove axis text
+        axis.text = element_blank(),
+        #remove title
+        axis.title = element_blank(),
+        #remove ticks
+        axis.ticks=element_blank(),
+        #change plot title to serif
+        plot.title = element_text(hjust = 0.5,
+                                  family = "serif",
+                                  size = 10,
+                                  face = "bold"),
+        plot.background = element_rect(fill = "aliceblue",
+                                       color = "transparent")) + 
+  ggtitle(label = "South Florida") 
+
+
+# make central american insert
+Ancestery_Sample_Map_CA_Insert <- ggplot2::ggplot(data = world) +
+  # add world polygons
+  geom_sf(fill= "antiquewhite", 
+            color = "black") +
+  coord_sf(xlim = c(-89.7, 
+                    -86.7),
+           ylim = c(16,
+                    18)) + 
+  # add the circles 
+ ggforce::geom_mark_ellipse(data = Ancestry.Location.STR8.DF, aes(x = Longitude, y = Latitude,
+                                                                   group = Population_ID, label = Population_Name,
+                                                                   x0 = -89,
+                                                                   y0 = 16.3,
+                                                                   filter = Population_ID == "UH"), 
+                            label.fontface = "plain",
+                             con.cap = 0, expand = 0.03, 
+                             label.fontsize = 8, label.family = "serif", con.border = "one", 
+                             label.buffer = unit(0.00000001, "mm"), 
+                             label.margin = margin(0.5, 0.5, 0.5, 0.5, "mm")) +
+  ggforce::geom_mark_ellipse(data = Ancestry.Location.STR8.DF, aes(x = Longitude, y = Latitude,
+                                                                   group = Population_ID, label = Population_Name,
+                                                                   x0 = -89.6,
+                                                                   y0 = 16.8,
+                                                                   filter = Population_ID == "TC"),
+                             label.fontface = "plain",
+                             con.cap = 0, expand = 0.03, 
+                             label.fontsize = 8, label.family = "serif", con.border = "one", 
+                             label.buffer = unit(0.00000001, "mm"), 
+                             label.margin = margin(0.5, 0.5, 0.5, 0.5, "mm")) +
+  ggforce::geom_mark_ellipse(data = Ancestry.Location.STR8.DF, aes(x = Longitude, y = Latitude,
+                                                                   group = Population_ID, label = Population_Name,
+                                                                   x0 = -89.5,
+                                                                   y0 = 17.2,
+                                                                   filter = Population_ID == "TA"), 
+                             label.fontface = "plain",
+                             con.cap = 0, expand = 0.03, 
+                             label.fontsize = 8, label.family = "serif", con.border = "one", 
+                             label.buffer = unit(0.0000001, "mm"), 
+                             label.margin = margin(0.5, 0.5, 0.5, 0.5, "mm")) +
+  ggforce::geom_mark_ellipse(data = Ancestry.Location.STR8.DF, aes(x = Longitude, y = Latitude,
+                                                                   group = Population_ID, label = Population_Name,
+                                                                   x0 = -89.6,
+                                                                   y0 = 17.6,
+                                                                   filter = Population_ID == "NC"),
+                             label.fontface = "plain",
+                             con.cap = 0, expand = 0.03, 
+                             label.fontsize = 8, label.family = "serif", con.border = "one", 
+                             label.buffer = unit(0.000001, "mm"), 
+                             label.margin = margin(0.5, 0.5, 0.5, 0.5, "mm")) +
+  ggforce::geom_mark_ellipse(data = Ancestry.Location.STR8.DF, aes(x = Longitude, y = Latitude,
+                                                                   group = Population_ID, label = Population_Name,
+                                                                   x0 = -86.7,
+                                                                   y0 = 16.8,
+                                                                   filter = Population_ID == "LC"),
+                             label.fontface = "plain",
+                             con.cap = 0, expand = 0.03, 
+                             label.fontsize = 8, label.family = "serif", con.border = "one", 
+                             label.buffer = unit(0.00000001, "mm"), 
+                             label.margin = margin(0.5, 0.5, 0.5, 0.5, "mm")) +
+  geom_point(data = Ancestry.Location.STR8.DF, aes(x = Longitude, y = Latitude, fill = Location_Population_Assigned),
+             shape=21, size = 2) +
+  # add scale bar and place in bottom right
+  ggspatial::annotation_scale(location = "bl",
+                   width_hint = 0.3,
+                   height = unit(0.12, "cm"),
+                   text_family = "serif") +
+  # place north arrow in top right
+  ggspatial::annotation_north_arrow(location = "tr", 
+                         which_north = "true", 
+        style = ggspatial::north_arrow_fancy_orienteering,
+        height = unit(.7, "cm"),
+        width = unit(.7, "cm"),) +
+  theme_void() +
+  scale_x_continuous(breaks= -88, minor_breaks=NULL) +
+  scale_y_continuous(breaks= 18, minor_breaks=NULL) +
+  scale_fill_brewer(palette = "Paired") +
+  #make dashed grid lines and fill the ocean with blue
+  theme(panel.background = element_rect(fill = "aliceblue"),
+        legend.position="none",
+        #make border
+        panel.border = element_rect(colour = "black",
+                                    fill=NA),
+        #plot margins
+        plot.margin = margin(-5,-10,0,-10),
+        #remove axis text
+        axis.text = element_blank(),
+        #remove title
+        axis.title = element_blank(),
+        #remove ticks
+        axis.ticks=element_blank(),
+        #change plot title to serif
+        plot.title = element_text(hjust = 0.5,
+                                  family = "serif",
+                                  size = 10,
+                                  face = "bold"),
+        plot.background = element_rect(fill = "aliceblue",
+                                       color = "transparent")) + 
+  ggtitle(label = "Central America") 
+
+# make one map with cowplot
+Ancestery_Sample_Map_Final <- cowplot::plot_grid(cowplot::plot_grid((cowplot::ggdraw() +
+             cowplot::draw_plot(Ancestery_Sample_Map) +
+               cowplot::draw_plot(Ancestery_Sample_Map_SF_Insert, 
+                         x = .122,
+                         y = .542, 
+                         width = .235, 
+                         height = .295) +
+               cowplot::draw_plot(Ancestery_Sample_Map_CA_Insert, 
+                         x = .119,
+                         y = .245, 
+                         width = .29, 
+                         height = .3) +
+               cowplot::draw_plot(STR_K8_Bar, 
+                         x = .4275,
+                         y = .0745, 
+                         width = .528, 
+                         height = .46)))) 
+
+
+
+```
+# Gene Flow
+
+## Heatmap
+
+```{r, heatmap df}
+# get a data frame and modify it for plotting
+Pairwise.GD.OC.Plotting <-  Pairwise.Pop.DF %>%
+  # add distance to the data frame
+  dplyr::left_join(., Ocean.Distance.df) %>%
+  # add the ocean current connectivity
+  dplyr::left_join(., Symmetric.OC) %>%
+  # transform
+  dplyr::mutate(value = round(value, 2),
+                value = dplyr::na_if(value, 0),
+                Time = (Time)^(1/2))
+```
+
+
+```{r, Heat map Hedrick Gst and OC}
+# make heat map for hedriks gst
+HGst.heatmap <- ggplot2::ggplot(data = (Pairwise.GD.OC.Plotting %>% # processes data frame
+                  dplyr::filter(GD == "Gst") %>% # filter the GD
+                    # mutate to get new order of populations
+                    dplyr::mutate(Pop1 = factor(Pop1, levels = c("UH", "TC", "LC", "TA", "NC", "SS", "EI", "LB", "LK", "UK", "EG", "FL", "CC", "TB", "SL", "IR", "NS")),
+                                  Pop2 = factor(Pop2, levels = c("UH", "TC", "LC", "TA", "NC", "SS", "EI", "LB", "LK", "UK", "EG", "FL", "CC", "TB", "SL", "IR", "NS"))) %>%
+                    # convert to matrix
+                    reshape2::acast(., Pop1 ~ Pop2, value.var = "value") %>%
+                    # get upper triangle
+                    Matrix::triu(., diag = TRUE) %>%
+                    # convert to matrix
+                    as.matrix(.) %>%
+                    # convert to data frame
+                    reshape2::melt(.) %>%
+                    # rename
+                    dplyr::rename(Pop1 = Var1,
+                                  Pop2 = Var2) %>%
+                    dplyr::filter(value != 0 | is.na(value))), 
+                  aes(x = Pop1, y = Pop2, fill = value)) + # graphing
+  # tile color
+  geom_tile(color = "black") +
+  # edit text labels
+  geom_text(aes(label = value), color = "white", size = 4, family = "serif") + 
+  # change gradients 
+  scale_fill_gradient(low = "lightcoral", high = "red4", na.value = "black") +
+  # change the lab axis labels
+    labs(x = "Population", y = "Population", fill = expression(G*"'"[ST])) +
+  # modify the theme
+    theme(text = element_text(family = "serif"),
+          panel.background = element_rect(fill='transparent'), #transparent panel bg
+          plot.background = element_rect(fill='transparent', color=NA), #transparent plot bg
+          panel.grid.major = element_blank(), #remove major grid lines
+          panel.grid.minor = element_blank(), # remove minor grid lines
+          legend.position = "left")
+    
+
+# get ocean current heat map
+OC.Sym.heatmap <- ggplot2::ggplot(data = (Pairwise.GD.OC.Plotting %>% # data frame for plotting
+                                            dplyr::filter(GD == "Gst") %>% # filter for only one GD
+                                            # get order of populations
+                                            dplyr::mutate(Pop1 = factor(Pop1, levels = c("UH", "TC", "LC", "TA", "NC", "SS", "EI", "LB", "LK", "UK", "EG", "FL", "CC", "TB", "SL", "IR", "NS")),
+                                                          Pop2 = factor(Pop2, levels = c("UH", "TC", "LC", "TA", "NC", "SS", "EI", "LB", "LK", "UK", "EG", "FL", "CC", "TB", "SL", "IR", "NS"))) %>%
+                                            # to matrix
+                                            reshape2::acast(., Pop1 ~ Pop2, value.var = "Time") %>%
+                                            # get lower
+                                            Matrix::tril(., diag = TRUE) %>%
+                                            # matrix
+                                            as.matrix(.) %>%
+                                            # to data frame
+                                            reshape2::melt(.) %>%
+                                            # rename
+                                            dplyr::rename(Pop1 = Var1,
+                                                          Pop2 = Var2) %>%
+                                            # filer for any zeros or NA
+                                            dplyr::filter(value != 0 | is.na(value)) %>%
+                                            # rename
+                                            dplyr::rename(Time = value) %>%
+                                            # mutate for time label
+                                            dplyr::mutate(Time.Label = sub("e","%.%10^",(as.character(scales::scientific(Time, digits = 2)))))),
+                                  aes(x = Pop1, y = Pop2, fill = Time)) +
+  # tile color
+  geom_tile(color = "black") +
+  # labels
+  labs(x = "Population", y = "Population", fill = expression(OC[S])) + 
+  # get text for labels
+  geom_text(aes(label = formatC(Time, digits = 2, format = "g")), color = "black", family = "serif", parse = TRUE) + 
+  # gradient 
+  scale_fill_gradient2(low = "white", mid = "deepskyblue", high = "dodgerblue4", midpoint = 0.001, na.value = "black") + 
+  # change theme
+  theme(text = element_text(family = "serif"),
+          panel.background = element_rect(fill='transparent'), #transparent panel bg
+          plot.background = element_rect(fill='transparent', color=NA), #transparent plot bg
+          panel.grid.major = element_blank(), #remove major gridlines
+          panel.grid.minor = element_blank(),
+          panel.grid = element_blank())
+
+# combine with cowplot
+Hgst.OC.Sym.Heatmap <- cowplot::plot_grid(
+  cowplot::plot_grid(
+    cowplot::get_legend(HGst.heatmap + 
+                          theme(legend.position = "top") +
+                          scale_fill_gradient(low = "lightcoral", high = "red4", na.value = "black",
+                                              guide = guide_colourbar(label.position = "top",
+                                                                      barwidth = 25, 
+                                                                      barheight = .75))),
+                   (cowplot::ggdraw() +
+             cowplot::draw_plot(HGst.heatmap + theme(legend.position = "none",
+                                                     axis.ticks = element_blank())) +
+               cowplot::draw_plot((OC.Sym.heatmap + theme(legend.position = "none",
+                                                          axis.ticks = element_blank())), 
+                         x = 0,
+                         y = 0, 
+                         width = 1, 
+                         height = 1)),
+             rel_heights = c(0.1, 1),
+             ncol = 1),
+             cowplot::get_legend(OC.Sym.heatmap + theme(legend.position = "right") +
+                          scale_fill_gradient2(low = "white", mid = "deepskyblue", 
+                                              high = "dodgerblue4", midpoint = 0.001, 
+                                              na.value = "black",
+                                              guide = guide_colourbar(barwidth = .75, 
+                                                                      barheight = 15))),
+                                 nrow = 1,
+                                 rel_widths = c(1,0.1))
+             
+# 11.25 and 6
+```
+
+```{r, heatmap Gst and D}
+
+# Gst heat map
+Gst.heatmap <- ggplot2::ggplot(data = (Pairwise.GD.OC.Plotting %>% # data frame
+                                         dplyr::filter(GD == "gst") %>% # filter
+                                         # get order of populations 
+                                         dplyr::mutate(Pop1 = factor(Pop1, levels = c("UH", "TC", "LC", "TA", "NC", "SS", "EI", "LB", "LK", "UK", "EG", "FL", "CC", "TB", "SL", "IR", "NS")),
+                                                       Pop2 = factor(Pop2, levels = c("UH", "TC", "LC", "TA", "NC", "SS", "EI", "LB", "LK", "UK", "EG", "FL", "CC", "TB", "SL", "IR", "NS"))) %>%
+                                         # to matrix
+                                         reshape2::acast(., Pop1 ~ Pop2, value.var = "value") %>%
+                                         # upper
+                                         Matrix::triu(., diag = TRUE) %>%
+                                         # as matrix
+                                         as.matrix(.) %>%
+                                         # as data frame
+                                         reshape2::melt(.) %>%
+                                         # rename
+                                         dplyr::rename(Pop1 = Var1,
+                                                       Pop2 = Var2) %>%
+                                         # filter out
+                                         dplyr::filter(value != 0 | is.na(value))), 
+                               aes(x = Pop1, y = Pop2, fill = value)) +
+  # tile color
+  geom_tile(color = "black") +
+  # text
+  geom_text(aes(label = value), color = "white", size = 4, family = "serif") + 
+  # legend
+  scale_fill_gradient(low = "lightcoral", high = "red4", na.value = "black") +
+  # labels
+    labs(x = "Population", y = "Population", fill = expression(G[ST])) +
+  # edit theme 
+    theme(text = element_text(family = "serif"),
+          panel.background = element_rect(fill='transparent'), #transparent panel bg
+          plot.background = element_rect(fill='transparent', color=NA), #transparent plot bg
+          panel.grid.major = element_blank(), #remove major grid lines
+          panel.grid.minor = element_blank(),
+          legend.position = "left")
+
+# for Jost D
+D.heatmap <- ggplot2::ggplot(data = (Pairwise.GD.OC.Plotting %>% # data frame
+                                       dplyr::filter(GD == "D") %>% # filter
+                                       # order populations
+                                       dplyr::mutate(Pop1 = factor(Pop1, levels = c("UH", "TC", "LC", "TA", "NC", "SS", "EI", "LB", "LK", "UK", "EG", "FL", "CC", "TB", "SL", "IR", "NS")),
+                                                     Pop2 = factor(Pop2, levels = c("UH", "TC", "LC", "TA", "NC", "SS", "EI", "LB", "LK", "UK", "EG", "FL", "CC", "TB", "SL", "IR", "NS"))) %>%
+                                       # to matrix
+                                       reshape2::acast(., Pop1 ~ Pop2, value.var = "value") %>%
+                                       # lower triangle
+                                       Matrix::tril(., diag = TRUE) %>%
+                                       # as matrix
+                                       as.matrix(.) %>%
+                                       # to data frame
+                                       reshape2::melt(.) %>%
+                                       # rename
+                                       dplyr::rename(Pop1 = Var1,
+                                                     Pop2 = Var2) %>%
+                                       # filter
+                                       dplyr::filter(value != 0 | is.na(value))),
+                             aes(x = Pop1, y = Pop2, fill = value)) +
+  # tile color
+  geom_tile(color = "black") +
+  # change text
+  geom_text(aes(label = value), color = "black", size = 4, family = "serif") + 
+  # legend
+  scale_fill_gradient(low = "thistle", high = "slateblue", na.value = "black") +
+  # labels
+    labs(x = "Population", y = "Population", fill = expression(D)) +
+  # edit theme
+    theme(text = element_text(family = "serif"),
+          panel.background = element_rect(fill='transparent'), #transparent panel bg
+          plot.background = element_rect(fill='transparent', color=NA), #transparent plot bg
+          panel.grid.major = element_blank(), #remove major gridlines
+          panel.grid.minor = element_blank(),
+          legend.position = "left")
+
+# merge heatmaps with cowplot
+Gst_D_HM <- cowplot::plot_grid(
+  cowplot::plot_grid(
+    cowplot::get_legend(Gst.heatmap + 
+                          theme(legend.position = "top") +
+                          scale_fill_gradient(low = "lightcoral", high = "red4", na.value = "black",
+                                              guide = guide_colourbar(label.position = "top",
+                                                                      barwidth = 25, 
+                                                                      barheight = .75))),
+                   (cowplot::ggdraw() +
+             cowplot::draw_plot(Gst.heatmap + theme(legend.position = "none",
+                                                     axis.ticks = element_blank())) +
+               cowplot::draw_plot((D.heatmap + theme(legend.position = "none",
+                                                          axis.ticks = element_blank())), 
+                         x = 0,
+                         y = 0, 
+                         width = 1, 
+                         height = 1)),
+             rel_heights = c(0.1, 1),
+             ncol = 1),
+             cowplot::get_legend(D.heatmap + theme(legend.position = "right") +
+                           scale_fill_gradient(low = "thistle",
+                                               high = "slateblue",
+                                               na.value = "black",
+                                               guide = guide_colourbar(barwidth = .75, 
+                                                                      barheight = 15))),
+                                 nrow = 1,
+                                 rel_widths = c(1,0.1))
+```
+
+```{r, heatmap Rst}
+# for Rst
+Rst.heatmap <- ggplot2::ggplot(data = (Pairwise.GD.OC.Plotting %>% # data frame
+                                       dplyr::filter(GD == "Rst") %>% # filter
+                                       # order populations
+                                       dplyr::mutate(Pop1 = factor(Pop1, levels = c("UH", "TC", "LC", "TA", "NC", "SS", "EI", "LB", "LK", "UK", "EG", "FL", "CC", "TB", "SL", "IR", "NS")),
+                                                     Pop2 = factor(Pop2, levels = c("UH", "TC", "LC", "TA", "NC", "SS", "EI", "LB", "LK", "UK", "EG", "FL", "CC", "TB", "SL", "IR", "NS"))) %>%
+                                       dplyr::filter(value != 0 | is.na(value))),
+                             aes(x = Pop1, y = Pop2, fill = value)) +
+  # tile color
+  geom_tile(color = "black") +
+  # change text
+  geom_text(aes(label = value), color = "white", size = 4, family = "serif") + 
+  # legend
+  scale_fill_gradient(low = "lightcoral", high = "red4", na.value = "black") +
+  # labels
+    labs(x = "Population", y = "Population", fill = expression(R[ST])) +
+  # edit theme
+    theme(text = element_text(family = "serif"),
+          panel.background = element_rect(fill='transparent'), #transparent panel bg
+          plot.background = element_rect(fill='transparent', color=NA), #transparent plot bg
+          panel.grid.major = element_blank(), #remove major gridlines
+          panel.grid.minor = element_blank(),
+          legend.position = "right")
+
+```
+
+```{r, Bayeass heat map}
+Bayesass.Heatmap <- Bayeass.Results %>%
+  tidyr::pivot_wider(., names_from = "Stat", values_from = "Value") %>%
+  dplyr::mutate(Mean = ifelse(Pop1 == Pop2, NA, Mean),
+                Value.Label = ifelse(Pop1 != Pop2, paste((as.character(formatC(Mean, digits = 2, format = "g"))), "±", as.character(formatC((SD*1.96), digits = 2, format = "g"))), NA),
+                Pop1 = factor(Pop1, levels = c("UH", "TC", "LC", "TA", "NC", "SS", "EI", "LB", "LK", "UK", "EG", "FL", "CC", "TB", "SL", "IR", "NS")),
+                Pop2 = factor(Pop2, levels = c("UH", "TC", "LC", "TA", "NC", "SS", "EI", "LB", "LK", "UK", "EG", "FL", "CC", "TB", "SL", "IR", "NS"))) %>%
+  ggplot2::ggplot(data = ., aes(x = Pop2, y = Pop1, fill = Mean)) +
+  geom_tile(color = "black") +
+  labs(x = "Sink", y = "Source") +
+  scale_fill_gradientn(colours = c("tomato2", "tomato3", "tomato4", "firebrick4"),
+                       limits = c(0, 0.2),
+                       values = scales::rescale(x = c(0, 0.005, 0.01, 0.2)),
+                       na.value = "black",
+                       guide = guide_colourbar(barwidth = 1, barheight = 15),
+                       name = "Migration \n   Rate") + 
+  geom_text(aes(label = Value.Label), color = "white", family = "serif") +
+  theme(text = element_text(family = "serif"),
+          panel.background = element_rect(fill='transparent'), #transparent panel bg
+          plot.background = element_rect(fill='transparent', color=NA), #transparent plot bg
+          panel.grid.major = element_blank(), #remove major gridlines
+          panel.grid.minor = element_blank(),
+          panel.grid = element_blank())
+  #19.5 by 8
+```
+
+```{r, Ocean current heat map}
+OC.Asym.heatmap <- ggplot2::ggplot(data = (Pairwise.Env.Asymmetric.DF %>%
+                                             dplyr::full_join(., data.frame(Pop1 = unique(Pairwise.Env.Asymmetric.DF$Pop1),
+                                                                          Pop2 = unique(Pairwise.Env.Asymmetric.DF$Pop1))) %>%
+                                             dplyr::mutate(Pop1 = factor(Pop1, levels = c("UH", "TC", "LC", "TA", "NC", "SS", "EI", "LB", "LK", "UK", "EG", "FL", "CC", "TB", "SL", "IR", "NS")),
+                                                           Pop2 = factor(Pop2, levels = c("UH", "TC", "LC", "TA", "NC", "SS", "EI", "LB", "LK", "UK", "EG", "FL", "CC", "TB", "SL", "IR", "NS")))),
+                                   aes(x = Pop2, y = Pop1, fill = Time)) +
+  geom_tile(color = "black") +
+  labs(x = "Sink", y = "Source", fill = expression(OC[A])) + 
+  scale_fill_gradientn(colours = c("deepskyblue", "dodgerblue", "dodgerblue3"),
+                       limits = c(0, 0.5),
+                       values = scales::rescale(x = c(0, 0.025, 0.5)),
+                       na.value = "black",
+                       guide = guide_colourbar(barwidth = 1, barheight = 15)) +
+  geom_text(aes(label =  formatC(Time, digits = 2, format = "g")), color = "black", family = "serif", parse = TRUE) + 
+  theme(text = element_text(family = "serif"),
+          panel.background = element_rect(fill='transparent'), #transparent panel bg
+          plot.background = element_rect(fill='transparent', color=NA), #transparent plot bg
+          panel.grid.major = element_blank(), #remove major gridlines
+          panel.grid.minor = element_blank(),
+          panel.grid = element_blank())
+# 12 by 5
+```
+
+```{r, Interaction Graph}
+# get data frame for graph
+Asymmetric_Interaction_df <- Pairwise.Env.Asymmetric.DF %>%
+  # scale everything
+  dplyr::mutate(Time = (Time - mean(Time))/sd(Time),
+                Distance = (Distance - mean(Distance))/sd(Distance),
+                Type = "Data") %>%
+  # select our columns
+  dplyr::select(-Region.Pop1, -Region.Pop2, -Pop1, -Pop2) %>%
+  # create tiles from linear model
+  rbind(., (tidyr::expand_grid(Time = seq(min((Pairwise.Env.Asymmetric.DF %>%
+                                                 dplyr::mutate(Time = (Time - mean(Time))/sd(Time),
+                                                               Distance = (Distance - mean(Distance))/sd(Distance)))$Time)- 0.5,
+                                          max((Pairwise.Env.Asymmetric.DF %>%
+                                                 dplyr::mutate(Time = (Time - mean(Time))/sd(Time),
+                                                               Distance = (Distance - mean(Distance))/sd(Distance)))$Time)+ 0.5, 
+                               by = ((max((Pairwise.Env.Asymmetric.DF %>%
+                                                 dplyr::mutate(Time = (Time - mean(Time))/sd(Time),
+                                                               Distance = (Distance - mean(Distance))/sd(Distance)))$Time) - min((Pairwise.Env.Asymmetric.DF %>%
+                                                 dplyr::mutate(Time = (Time - mean(Time))/sd(Time),
+                                                               Distance = (Distance - mean(Distance))/sd(Distance)))$Time))/100)),
+                               Distance =  seq(min((Pairwise.Env.Asymmetric.DF %>%
+                                                 dplyr::mutate(Time = (Time - mean(Time))/sd(Time),
+                                                               Distance = (Distance - mean(Distance))/sd(Distance)))$Distance)- 0.5, max((Pairwise.Env.Asymmetric.DF %>%
+                                                 dplyr::mutate(Time = (Time - mean(Time))/sd(Time),
+                                                               Distance = (Distance - mean(Distance))/sd(Distance)))$Distance)+ 0.5, 
+                               by = ((max((Pairwise.Env.Asymmetric.DF %>%
+                                                 dplyr::mutate(Time = (Time - mean(Time))/sd(Time),
+                                                               Distance = (Distance - mean(Distance))/sd(Distance)))$Distance) - min((Pairwise.Env.Asymmetric.DF %>%
+                                                 dplyr::mutate(Time = (Time - mean(Time))/sd(Time),
+                                                               Distance = (Distance - mean(Distance))/sd(Distance)))$Distance))/100))) %>%
+              dplyr::mutate(value = predict((lm(value ~ (Time + Distance)^2, 
+                                                data = (Pairwise.Env.Asymmetric.DF %>%
+                                                          dplyr::mutate(Time = (Time - mean(Time))/sd(Time),
+                                                                        Distance = (Distance - mean(Distance))/sd(Distance))))), newdata = data.frame(.)),
+                            Type = "Predicted"))) 
+
+# plot interaction term
+Asymmetric.Interaction.Plot <- ggplot2::ggplot() +
+  # add tiles
+  geom_tile(data = (Asymmetric_Interaction_df %>%
+                            dplyr::filter(Type != "Data")), aes(x = Distance, y = Time, fill = value)) +
+  # change legend
+  scale_fill_viridis_c(name = expression("Migration Rate"^"1/4"), alpha = 0.9) +
+  # add points
+    geom_point(data = (Asymmetric_Interaction_df %>%
+                            dplyr::filter(Type == "Data")), aes(x = Distance, y = Time, fill = value),
+               colour="black", pch=21, size = 2) +
+  # labels
+    labs(x = "Distance (log) - Scaled", y = expression(OC[A]*" - Scaled")) +
+  # axis
+    scale_x_continuous(expand = c(0,0)) + 
+  # axis
+    scale_y_continuous(expand = c(0,0)) +
+  # change theme
+    theme(text = element_text(family = "serif"),
+          panel.border = element_rect(fill='NA', color = "black", linewidth = 2),
+          panel.background = element_rect(fill='transparent'), #transparent panel bg
+          plot.background = element_rect(fill='transparent', color= "black"), #transparent plot bg
+          panel.grid.major = element_blank(), #remove major gridlines
+          panel.grid.minor = element_blank())
+
+```

@@ -1,0 +1,6 @@
+new("snmfClass", directory = "K8/run13/", snmfClass.file = "Riv_STR.txt_r13.8.snmfClass", 
+    K = 8L, run = 13L, CPU = 1L, seed = 967477483L, alpha = 100, 
+    percentage = 0.05, I = 0L, iterations = 100000L, entropy = TRUE, 
+    tolerance = 1e-05, crossEntropy = 0.138280389061871, ploidy = 2L, 
+    Q.input.file = "", Q.output.file = "Riv_STR.txt_r13.8.Q", 
+    G.output.file = "Riv_STR.txt_r13.8.G")

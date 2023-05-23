@@ -1,0 +1,35 @@
+ &nest_input
+filename = "http://tds.hycom.org/thredds/dodsC/GLBu0.08/expt_19.1/3hrly"
+ xaxis = "lon"
+ yaxis = "lat"
+ zaxis = "depth"
+ taxis = "time"
+ xstart = -95
+ xend = -77
+ ystart = 12
+yend = 32
+ zstart = 0
+ zend = 10
+ zaxis_positive_direction = "down"
+ tstart_yy = 1999
+ tstart_mm = 12
+ tstart_dd = 25
+ tend_yy = 2001
+ tend_mm = 6
+ tend_dd = 00
+ time_step = 10800
+ time_units = "hours"
+ jdate_yy = 2000
+ jdate_mm = 01
+ jdate_dd = 01
+ lon_name = "lon"
+ lat_name = "lat"
+ depth_name = "depth"
+ depth_conversion_factor = 1
+ time_name = "time"
+ uvel_name = "water_u"
+ vvel_name = "water_v"
+ angle_file = ""
+ fill_value = 1.2676506E30
+ agrid = .true.
+$end
